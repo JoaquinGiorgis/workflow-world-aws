@@ -1,0 +1,73 @@
+{
+  "name": "@joaquingiorgis/world-aws",
+  "version": "0.0.0",
+  "description": "A Workflow SDK World backed by DynamoDB, SQS and S3",
+  "type": "module",
+  "license": "MIT",
+  "author": "Joaquín Giorgis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JoaquinGiorgis/workflow-world-aws.git"
+  },
+  "keywords": [
+    "workflow",
+    "world",
+    "aws",
+    "dynamodb",
+    "sqs"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "bootstrap:local": "tsx scripts/bootstrap-local.ts",
+    "changeset": "changeset"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "peerDependencies": {
+    "@workflow/world": "^5.2.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1169.0",
+    "@aws-sdk/client-s3": "^3.1169.0",
+    "@aws-sdk/client-sqs": "^3.1169.0",
+    "@aws-sdk/lib-dynamodb": "^3.1169.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.8",
+    "@changesets/cli": "^3.0.3",
+    "@types/node": "^22.20.5",
+    "@workflow/world": "^5.2.0",
+    "@workflow/world-testing": "5.1.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "tsup": "^9.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}
