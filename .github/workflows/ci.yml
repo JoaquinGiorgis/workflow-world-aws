@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly run against the latest @workflow/world in the range, to catch
+    # contract changes early.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Lint, typecheck, unit tests, build (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Enable corepack
+        run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - name: Update @workflow/world to the latest in range (weekly run)
+        if: github.event_name == 'schedule'
+        run: pnpm update @workflow/world
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: Check package contents
+        run: pnpm pack --dry-run
+
+  integration:
+    name: Integration tests (LocalStack)
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:4
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: dynamodb,sqs,s3
+          # Only needed if the image in use requires an account token.
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        options: >-
+          --health-cmd "curl -fs http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      WORKFLOW_AWS_ENDPOINT: http://localhost:4566
+      WORKFLOW_AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Enable corepack
+        run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      # The global setup finds LocalStack already answering, so it does not
+      # start moto_server. It sets dummy credentials itself.
+      - run: pnpm test:integration
