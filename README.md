@@ -29,7 +29,12 @@ never reads or stores them itself.
 
 `createWorld({ clients })` accepts SDK clients you created yourself (for
 instrumentation or custom credentials); the World does not destroy them on
-`close()`.
+`close()`. `createWorld({ retry })` tunes how a write that loses a race with
+another writer of the same run is retried (`maxAttempts`,
+`immediateAttempts`, `baseDelayMs`, `maxDelayMs`): by default 40 attempts,
+the first two at once and then with exponential backoff and full jitter
+capped at 250 ms, after which the write fails with a 503
+`WorkflowWorldError`.
 
 ## Storage
 
@@ -73,11 +78,17 @@ every 500 ms.
 
 Limits:
 
-- An item is at most 400 KB in DynamoDB. A write that would store a larger
-  payload (step input or output, run input, hook payload, VM snapshot) is
-  refused with `PayloadTooLargeError` (`status: 413`,
-  `code: 'PAYLOAD_TOO_LARGE'`) before anything is written. Offloading large
-  payloads to S3 is planned (M3).
+- DynamoDB stores items of up to 400 KB. The World refuses any item over
+  350 KB, keeping the rest as margin for key and index attributes: a write
+  that would store a larger payload (step input or output, run input or
+  output, hook payload, VM snapshot), or grow the run item past it (input,
+  output, error and attributes live on one item), is refused with
+  `PayloadTooLargeError` (`status: 413`, `code: 'PAYLOAD_TOO_LARGE'`) before
+  anything is written. If DynamoDB itself refuses an item for its size, the
+  same error is raised. Offloading large payloads to S3 is planned (M3).
+- Pagination cursors of `runs.list`, `steps.list` and `hooks.list` are
+  opaque and only valid for the list (index, run or workflow) that returned
+  them; any other cursor is refused with a 400 `WorkflowWorldError`.
 - `events.listByCorrelationId` reads the run's log with a filter, so its
   cost grows with the length of the log.
 - The `RUNS` and `HOOKS` index partitions take every run and hook: at very
