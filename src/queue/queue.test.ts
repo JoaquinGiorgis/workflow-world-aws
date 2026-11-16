@@ -17,6 +17,7 @@ import {
   queueOptions,
   sent,
 } from '../../test/unit/sqs-mock.js';
+import { SQS_MAX_SEND_MS } from '../clients.js';
 import {
   IDEMPOTENCY_TTL_SECONDS,
   RESERVATION_TIMEOUT_MS,
@@ -178,10 +179,32 @@ describe('queue() with an idempotency key', () => {
       idempotencyKey: 'step-key',
     });
     const update = mocks.ddbMock.commandCalls(UpdateCommand)[0]?.args[0].input;
+    // Confirmed only while the reservation is still the one this send made.
+    expect(update?.ConditionExpression).toBe(
+      'messageId = :id AND reservedAt = :mine'
+    );
     expect(update?.ExpressionAttributeValues).toEqual({
       ':sent': 'sent',
       ':id': messageId,
+      ':mine': put?.Item?.reservedAt,
     });
+    await queue.close();
+  });
+
+  it('warns when another sender overtook the reservation before it was confirmed', async () => {
+    mocks.ddbMock.on(UpdateCommand).rejects(conditionFailed());
+    const log = vi.fn();
+    const queue = createSqsQueue(queueOptions(mocks, { internal: { log } }));
+    const { messageId } = await queue.queue(
+      queueName,
+      { runId: 'wrun_A', stepId: 'step_1' } as never,
+      { idempotencyKey: 'overtaken' }
+    );
+    expect(sent(mocks)).toHaveLength(1);
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('overtaken'),
+      expect.objectContaining({ idempotencyKey: 'overtaken', messageId })
+    );
     await queue.close();
   });
 
@@ -244,9 +267,56 @@ describe('queue() with an idempotency key', () => {
     expect(sent(mocks)[0]?.message.messageId).toBe(
       'msg_01JD000000000000000000DEAD'
     );
-    const takeOver =
-      mocks.ddbMock.commandCalls(UpdateCommand)[0]?.args[0].input;
+    const [takeOver, confirm] = mocks.ddbMock
+      .commandCalls(UpdateCommand)
+      .map((call) => call.args[0].input);
     expect(takeOver?.ConditionExpression).toContain('reservedAt = :then');
+    // The confirmation is conditioned on the taker's own reservation time.
+    expect(confirm?.ExpressionAttributeValues?.[':mine']).toBe(
+      takeOver?.ExpressionAttributeValues?.[':now']
+    );
+    await queue.close();
+  });
+
+  it('does not take over a reservation while its sender can still be sending', async () => {
+    expect(RESERVATION_TIMEOUT_MS).toBeGreaterThanOrEqual(4 * SQS_MAX_SEND_MS);
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    mocks.ddbMock.on(PutCommand).rejects(conditionFailed());
+    // The original sender reserved the key as long ago as its SQS client
+    // can keep one send going (every attempt timing out, plus backoff).
+    const reservedAt = Date.now() - SQS_MAX_SEND_MS;
+    mocks.ddbMock.on(GetCommand).resolves({
+      Item: {
+        messageId: 'msg_01JD000000000000000000SLOW',
+        state: 'reserved',
+        reservedAt,
+        expiresAt: Math.floor(Date.now() / 1000) + IDEMPOTENCY_TTL_SECONDS,
+      },
+    });
+    const queue = createSqsQueue(queueOptions(mocks));
+    const result = queue.queue(queueName, { runId: 'wrun_A' } as never, {
+      idempotencyKey: 'slow',
+    });
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mocks.ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    expect(sent(mocks)).toHaveLength(0);
+
+    // Still waiting just before the reservation times out.
+    await vi.advanceTimersByTimeAsync(
+      reservedAt + RESERVATION_TIMEOUT_MS - Date.now() - 200
+    );
+    expect(mocks.ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    expect(sent(mocks)).toHaveLength(0);
+
+    // Once it has, the sender is gone: take the reservation over.
+    await vi.advanceTimersByTimeAsync(400);
+    expect((await result).messageId).toBe('msg_01JD000000000000000000SLOW');
+    expect(sent(mocks)).toHaveLength(1);
+    expect(
+      mocks.ddbMock.commandCalls(UpdateCommand)[0]?.args[0].input
+        .ConditionExpression
+    ).toContain('reservedAt = :then');
     await queue.close();
   });
 
@@ -260,8 +330,13 @@ describe('queue() with an idempotency key', () => {
     ).rejects.toThrow('throttled');
     const release = mocks.ddbMock.commandCalls(DeleteCommand)[0]?.args[0].input;
     expect(release?.Key).toEqual({ PK: 'IDEMP#retry-me', SK: 'Q' });
+    // Only its own reservation: one another sender took over stays.
     expect(release?.ConditionExpression).toBe(
-      'messageId = :id AND #state = :reserved'
+      'messageId = :id AND reservedAt = :mine AND #state = :reserved'
+    );
+    const put = mocks.ddbMock.commandCalls(PutCommand)[0]?.args[0].input;
+    expect(release?.ExpressionAttributeValues?.[':mine']).toBe(
+      put?.Item?.reservedAt
     );
     expect(mocks.ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
     await queue.close();
@@ -351,6 +426,22 @@ describe('queueBatch()', () => {
         .map((call) => call.args[0].input.Key?.PK)
     ).toEqual(['IDEMP#key-3']);
     expect(mocks.ddbMock.commandCalls(UpdateCommand)).toHaveLength(11);
+    // Each conditioned on the reservation its own put made.
+    const reservedAt = new Map(
+      mocks.ddbMock
+        .commandCalls(PutCommand)
+        .map((call) => call.args[0].input.Item)
+        .map((item) => [item?.PK, item?.reservedAt])
+    );
+    for (const call of [
+      ...mocks.ddbMock.commandCalls(UpdateCommand),
+      ...mocks.ddbMock.commandCalls(DeleteCommand),
+    ]) {
+      const input = call.args[0].input;
+      expect(input.ExpressionAttributeValues?.[':mine']).toBe(
+        reservedAt.get(input.Key?.PK)
+      );
+    }
     await queue.close();
   });
 
