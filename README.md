@@ -223,10 +223,10 @@ also runs `world.recover()` (once per `recoveryIntervalSeconds` per table,
 across processes; `createSqsLambdaHandler({ recover: false })` turns it
 off). If it fails, the next event tries again, unless the failure would
 repeat (a missing GSI3, access denied or another AWS client error that is
-not throttling): then a warning says so and only a new process tries
-again. Before answering, the handler waits for the idempotency-key
-confirmations its deliveries started, since Lambda may freeze the process
-right after.
+neither throttling nor expired credentials): then a warning says so and
+only a new process tries again. Before answering, the handler waits for
+the idempotency-key confirmations its deliveries started, since Lambda
+may freeze the process right after.
 
 **Recovery needs an event.** Lambda runs the handler only when a message
 arrives, and the `api` side never recovers. If the message that would

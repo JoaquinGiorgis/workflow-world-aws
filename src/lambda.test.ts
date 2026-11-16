@@ -396,6 +396,43 @@ describe('createSqsLambdaHandler', () => {
     }
   );
 
+  it.each([
+    ['ExpiredTokenException', 400],
+    ['ExpiredToken', 400],
+    ['RequestExpired', 400],
+  ])(
+    'tries recovery again on the next event after %s (expired credentials)',
+    async (name, status) => {
+      ddb
+        .on(QueryCommand)
+        .rejectsOnce(
+          Object.assign(new Error('The security token included has expired'), {
+            name,
+            $fault: 'client',
+            $metadata: { httpStatusCode: status },
+          })
+        )
+        .resolves({ Items: [] });
+      const log = vi.fn();
+      const lambda = createSqsLambdaHandler({
+        world: world(async () => undefined),
+        log,
+      });
+      await lambda(event(record({ payload: { runId: 'wrun_A' } })));
+      await lambda(event(record({ payload: { runId: 'wrun_A' } })));
+      expect(
+        ddb
+          .commandCalls(QueryCommand)
+          .filter((call) => call.args[0].input.IndexName === 'GSI3')
+      ).toHaveLength(2);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining('trying again on the next event'),
+        expect.anything()
+      );
+    }
+  );
+
   it('sends its warnings to the logger it was given', async () => {
     ddb
       .on(QueryCommand)

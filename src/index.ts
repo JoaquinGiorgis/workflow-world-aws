@@ -292,9 +292,20 @@ const THROTTLING_ERRORS = new Set([
 ]);
 
 /**
+ * Client errors that pass: credentials that expired (the SDK's provider
+ * refreshes them on the next call) and a request signed too long ago or
+ * with a skewed clock (the SDK corrects its clock offset).
+ */
+const PASSING_CLIENT_ERRORS = new Set([
+  'RequestExpired',
+  'TokenRefreshRequired',
+  'RequestTimeTooSkewed',
+]);
+
+/**
  * Whether a failed recovery would fail again on the next event: a missing
  * index, or an AWS client error (access denied, a validation error) that
- * is not throttling.
+ * is neither throttling nor expired credentials.
  */
 function isPermanentFailure(error: unknown): boolean {
   const { code, name, $fault, $metadata, $retryable } = (error ?? {}) as {
@@ -308,7 +319,10 @@ function isPermanentFailure(error: unknown): boolean {
   const status = $metadata?.httpStatusCode;
   if (
     $retryable?.throttling ||
-    (typeof name === 'string' && THROTTLING_ERRORS.has(name)) ||
+    (typeof name === 'string' &&
+      (THROTTLING_ERRORS.has(name) ||
+        PASSING_CLIENT_ERRORS.has(name) ||
+        name.startsWith('ExpiredToken'))) ||
     status === 429
   ) {
     return false;
