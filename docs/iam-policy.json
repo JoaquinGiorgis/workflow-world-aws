@@ -1,0 +1,47 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WorkflowTableItems",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:BatchGetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:ConditionCheckItem"
+      ],
+      "Resource": ["arn:aws:dynamodb:<region>:<account-id>:table/<table>"]
+    },
+    {
+      "Sid": "WorkflowTableQueries",
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query"],
+      "Resource": [
+        "arn:aws:dynamodb:<region>:<account-id>:table/<table>",
+        "arn:aws:dynamodb:<region>:<account-id>:table/<table>/index/*"
+      ]
+    },
+    {
+      "Sid": "WorkflowQueues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": [
+        "arn:aws:sqs:<region>:<account-id>:<workflow-queue>",
+        "arn:aws:sqs:<region>:<account-id>:<step-queue>"
+      ]
+    },
+    {
+      "Sid": "WorkflowPayloads",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::<bucket>/*"]
+    }
+  ]
+}

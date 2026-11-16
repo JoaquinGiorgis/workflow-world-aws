@@ -321,6 +321,7 @@ The smallest policy the World needs:
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "WorkflowTableItems",
       "Effect": "Allow",
       "Action": [
         "dynamodb:GetItem",
@@ -328,15 +329,21 @@ The smallest policy the World needs:
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
         "dynamodb:DeleteItem",
-        "dynamodb:ConditionCheckItem",
-        "dynamodb:Query"
+        "dynamodb:ConditionCheckItem"
       ],
+      "Resource": ["arn:aws:dynamodb:<region>:<account-id>:table/<table>"]
+    },
+    {
+      "Sid": "WorkflowTableQueries",
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query"],
       "Resource": [
-        "arn:aws:dynamodb:<region>:<account>:table/<table>",
-        "arn:aws:dynamodb:<region>:<account>:table/<table>/index/*"
+        "arn:aws:dynamodb:<region>:<account-id>:table/<table>",
+        "arn:aws:dynamodb:<region>:<account-id>:table/<table>/index/*"
       ]
     },
     {
+      "Sid": "WorkflowQueues",
       "Effect": "Allow",
       "Action": [
         "sqs:SendMessage",
@@ -345,26 +352,46 @@ The smallest policy the World needs:
         "sqs:ChangeMessageVisibility"
       ],
       "Resource": [
-        "arn:aws:sqs:<region>:<account>:<workflow-queue>",
-        "arn:aws:sqs:<region>:<account>:<step-queue>"
+        "arn:aws:sqs:<region>:<account-id>:<workflow-queue>",
+        "arn:aws:sqs:<region>:<account-id>:<step-queue>"
       ]
     },
     {
+      "Sid": "WorkflowPayloads",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::<bucket>/*"
+      "Resource": ["arn:aws:s3:::<bucket>/*"]
     }
   ]
 }
 ```
 
-`TransactWriteItems` is authorized by the item actions inside it, and
-`SendMessageBatch` by `sqs:SendMessage`. The dead-letter queues need no
-permission for the World: SQS moves messages there itself. A process that
-only starts runs and never calls `start()` needs no `sqs:ReceiveMessage`,
-`sqs:DeleteMessage` or `sqs:ChangeMessageVisibility`. Without a bucket the
-S3 statement can go, unless a World with one wrote references earlier
-(reads then need `s3:GetObject`).
+The same file is [`docs/iam-policy.json`](docs/iam-policy.json); replace
+the placeholders. A unit test checks it against every AWS SDK command in
+`src/`, so it stays the smallest policy that works:
+
+- `TransactWriteItems` is authorized by the item actions inside it, and
+  `SendMessageBatch` by `sqs:SendMessage`. Only `Query` reads the indexes
+  (GSI1, GSI2, GSI3).
+- The dead-letter queues need no permission: SQS moves messages there
+  itself.
+- A process that only starts runs and never runs the worker needs no
+  `sqs:ReceiveMessage`, `sqs:DeleteMessage` or
+  `sqs:ChangeMessageVisibility`.
+- In Lambda mode, the function's code calls `sqs:SendMessage` and
+  `sqs:ChangeMessageVisibility`; the event source mapping receives and
+  deletes with the function's role too, and also needs
+  `sqs:GetQueueAttributes` on both queues (the managed policy
+  `AWSLambdaSQSQueueExecutionRole`, or SAM's `SQSPollerPolicy`, grant the
+  three).
+- Without a bucket the S3 statement can go, unless a World with one wrote
+  references earlier (reads then need `s3:GetObject`). The keys are
+  `<runId>/...` and `queue/...` at the root of the bucket, so give the
+  World a bucket of its own. A bucket encrypted with a customer managed
+  KMS key also needs `kms:GenerateDataKey` and `kms:Decrypt` on that key.
+- Creating the resources (`pnpm bootstrap:local`, the SAM template in
+  `examples/hono`) needs more: that is a deploy-time role, not the
+  World's.
 
 ## Development
 
