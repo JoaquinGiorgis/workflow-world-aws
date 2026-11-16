@@ -1,0 +1,36 @@
+{
+  "name": "world-aws-example-hono",
+  "private": true,
+  "type": "module",
+  "description": "A Hono app running a Workflow SDK workflow on @joaquingiorgis/world-aws",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "workflow build && node scripts/well-known-types.mjs",
+    "start": "node src/server.ts",
+    "start:lambda": "node src/local-lambda.ts",
+    "typecheck": "tsc --noEmit",
+    "test:template": "node --test scripts/template.test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1169.0",
+    "@hono/node-server": "1.19.18",
+    "@joaquingiorgis/world-aws": "link:../..",
+    "hono": "4.13.17",
+    "workflow": "5.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@workflow/cli": "5.1.0",
+    "typescript": "^7.0.2",
+    "yaml": "^2.8.1"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

@@ -6,7 +6,13 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["**", "!**/node_modules", "!**/dist", "!**/.changeset"],
+    "includes": [
+      "**",
+      "!**/node_modules",
+      "!**/dist",
+      "!**/.changeset",
+      "!examples"
+    ],
     "ignoreUnknown": true
   },
   "formatter": {

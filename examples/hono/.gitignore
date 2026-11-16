@@ -1,0 +1,5 @@
+node_modules
+.well-known
+.workflow-data
+.aws-sam
+/.swc
