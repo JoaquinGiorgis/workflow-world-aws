@@ -16,6 +16,7 @@
  * | Hook token claim       | `HOOKTOKEN#<token>`      | `TOKEN`             |
  * | Stream chunk           | `STREAM#<runId>#<name>`  | `CHUNK#<seq>`       |
  * | Stream end marker      | `STREAM#<runId>#<name>`  | `CLOSED`            |
+ * | Stream name (per run)  | `STREAMS#<runId>`        | `NAME#<name>`       |
  * | Queue idempotency      | `IDEMP#<key>`            | `Q`                 |
  *
  * Event ids are slots (`evnt_` and a 26-digit zero-padded position), so
@@ -60,6 +61,8 @@ export const PREFIX = {
   hookToken: 'HOOKTOKEN#',
   stream: 'STREAM#',
   chunk: 'CHUNK#',
+  streamNames: 'STREAMS#',
+  streamName: 'NAME#',
   idempotency: 'IDEMP#',
   runsByWorkflow: 'WF#',
 } as const;
@@ -221,6 +224,19 @@ export function chunkKey(runId: string, name: string, seq: number): TableKey {
 
 export function streamClosedKey(runId: string, name: string): TableKey {
   return { PK: streamPk(runId, name), SK: STREAM_CLOSED_SK };
+}
+
+/** The partition listing a run's stream names, for `streams.list`. */
+export function streamNamesPk(runId: string): string {
+  return `${PREFIX.streamNames}${requireRunId(runId)}`;
+}
+
+/** Records that the run has a stream called `name`. */
+export function streamNameKey(runId: string, name: string): TableKey {
+  return {
+    PK: streamNamesPk(runId),
+    SK: `${PREFIX.streamName}${requireComponent(name, 'stream name')}`,
+  };
 }
 
 export function idempotencyKey(key: string): TableKey {
