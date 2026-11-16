@@ -12,8 +12,9 @@ too large for either.
   process, or by a Lambda function behind an SQS event source mapping.
 - Values over the DynamoDB item limit and queue messages over 256 KiB go to
   an S3 bucket.
-- Passes the whole `@workflow/world-testing` suite at spec 8 and spec 9
-  (spec 9 is opt-in, `WORKFLOW_SPEC_VERSION=9`).
+- Passes every test the `@workflow/world-testing` suite runs for a World
+  with `queueAuthMode: 'skip'` (it skips its queue-auth tests for those),
+  at spec 8 and spec 9 (spec 9 is opt-in, `WORKFLOW_SPEC_VERSION=9`).
 
 See [Status](#status) for what has and has not been tested.
 
@@ -42,6 +43,9 @@ pnpm add @joaquingiorgis/world-aws
 Requires Node.js 22 or later and `@workflow/world` 5.2 or later (a peer
 dependency, installed with the `workflow` package). The AWS SDK v3 clients
 for DynamoDB, SQS and S3 come as dependencies.
+
+The package is ESM only. `import` it (the Workflow runtime loads Worlds
+with `import()`); `require()` from CommonJS works from Node.js 22.12 on.
 
 ## Quick start
 
@@ -210,14 +214,31 @@ hops of long delays are sent on. Then:
   the dead-letter queue;
 - a failed delivery is reported in `batchItemFailures`, after the handler
   sets its visibility to the same backoff as the worker (`e^n` seconds for
-  the `n`-th receive, at most an hour). Lambda leaves it in the queue.
+  the `n`-th receive, at most an hour). Lambda leaves it in the queue. A
+  record whose handling throws is backed off and reported the same way.
 
 Records of one event run up to `concurrency` at a time; records of the
 same spec 9 run wait for each other. The first event a process handles
 also runs `world.recover()` (once per `recoveryIntervalSeconds` per table,
 across processes; `createSqsLambdaHandler({ recover: false })` turns it
-off). Before answering, the handler waits for the writes its deliveries
-started, since Lambda may freeze the process right after.
+off). If it fails, the next event tries again, unless the failure would
+repeat (a missing GSI3, access denied or another AWS client error that is
+not throttling): then a warning says so and only a new process tries
+again. Before answering, the handler waits for the idempotency-key
+confirmations its deliveries started, since Lambda may freeze the process
+right after.
+
+**Recovery needs an event.** Lambda runs the handler only when a message
+arrives, and the `api` side never recovers. If the message that would
+continue a run is lost and the queues are otherwise idle, the run stays
+`running` until some other message arrives. Where the queues can be idle,
+recover on a schedule: an EventBridge rule invoking a small function that
+calls `world.recover()` (the SAM template in `examples/hono` has one,
+every 15 minutes). A periodic no-op message to a queue does not do it: a
+warm process recovers only on its first event, and a body that is not a
+World message is reported and retried until it reaches the dead-letter
+queue. The per-table interval keeps a schedule from recovering more often
+than `recoveryIntervalSeconds`.
 
 Setting up the mappings:
 
@@ -316,6 +337,13 @@ works:
   `<runId>/...` and `queue/...` at the root of the bucket, so give the
   World a bucket of its own. A bucket encrypted with a customer managed
   KMS key also needs `kms:GenerateDataKey` and `kms:Decrypt` on that key.
+- Queues encrypted with a customer managed KMS key (SSE-KMS) need
+  `kms:GenerateDataKey` and `kms:Decrypt` on that key for every process
+  that sends, and `kms:Decrypt` for the consumer: the worker's role, or in
+  Lambda mode the function's role, which the event source mapping uses.
+- The policy grants no `s3:ListBucket`, so S3 answers a `GetObject` of a
+  missing key with `AccessDenied` instead of `NoSuchKey` (see
+  [Troubleshooting](#troubleshooting)).
 - Creating the resources (`pnpm bootstrap:local`, the SAM template in
   `examples/hono`) needs more: that is a deploy-time role, not the
   World's.
@@ -555,7 +583,11 @@ does not exist in the region, or the name is wrong.
 
 **`AccessDeniedException` / `AccessDenied`.** The role misses an action of
 the [IAM policy](#iam), often `dynamodb:Query` on `table/<table>/index/*`
-or `dynamodb:ConditionCheckItem`.
+or `dynamodb:ConditionCheckItem`. An S3 `AccessDenied` on `GetObject` can
+also mean the object is gone: without `s3:ListBucket`, S3 answers a
+missing key with 403, not 404. A `queue/...` body expired by a lifecycle
+rule, for a message that sat in a queue longer than that, looks like
+this.
 
 **Runs stay `pending` or `running` and nothing happens.**
 
@@ -565,7 +597,12 @@ or `dynamodb:ConditionCheckItem`.
   each delivery with "no base URL is known".
 - Lambda mode: do the event source mappings point at both queues and have
   `ReportBatchItemFailures`? Is the flow route's handler registered on the
-  World the handler uses?
+  World the handler uses? A run whose next message was lost is recovered
+  only on the first event of a new process; with idle queues that may
+  never come. Recover on a schedule (see
+  [Lambda mode](#lambda-mode)), or call `world.recover()` once by hand
+  (it does nothing if the table was recovered within
+  `recoveryIntervalSeconds`).
 - Look at the dead-letter queues and at `DEBUG=workflow:*` output: each
   delivery's start and outcome is logged.
 
@@ -611,8 +648,9 @@ They include the storage tests of world-postgres and world-local (ported),
 the `@workflow/world` conformance suites for the in-band fence and the
 atomic start Hook, the stream suites of world-postgres and world-local,
 the queue and Lambda mode end to end on the emulator's SQS (Lambda events
-built from real `ReceiveMessage` calls), S3 offload, and the whole
-`@workflow/world-testing` suite at spec 8 and spec 9 against the World
+built from real `ReceiveMessage` calls), S3 offload, and the `@workflow/world-testing` suite (all but its
+queue-auth tests, which it skips for this World's `queueAuthMode:
+'skip'`) at spec 8 and spec 9 against the World
 bundled with tsup, each test with its own table and queues. moto does not
 isolate concurrent `TransactWriteItems`, so against moto the storage
 suites send their DynamoDB requests one at a time (the world-testing
