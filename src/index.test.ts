@@ -229,6 +229,8 @@ describe('createWorld', () => {
         'ResourceNotFoundException',
         'Invalid index: GSI3 for table: workflow. Available indexes are: GSI1, GSI2',
       ],
+      // LocalStack does not name the index it could not find.
+      ['LocalStack', 'ResourceNotFoundException', 'Index not found'],
     ])(
       'names the missing GSI3 and how to add it (%s)',
       async (_, name, message) => {
@@ -255,6 +257,29 @@ describe('createWorld', () => {
         }
       }
     );
+
+    it('keeps a missing table a plain DynamoDB error', async () => {
+      const clients = createClients(options);
+      const ddb = mockClient(clients.documents);
+      ddb
+        .on(QueryCommand)
+        .rejects(
+          missingIndex(
+            'ResourceNotFoundException',
+            'Cannot do operations on a non-existent table'
+          )
+        );
+      const world = createWorld({ ...options, clients });
+      try {
+        await expect(
+          world.runs.list({ status: 'running' })
+        ).rejects.toMatchObject({ name: 'ResourceNotFoundException' });
+      } finally {
+        await world.close();
+        ddb.restore();
+        destroyClients(clients);
+      }
+    });
 
     it('does not start the worker, and the next start() recovers', async () => {
       const clients = createClients(options);

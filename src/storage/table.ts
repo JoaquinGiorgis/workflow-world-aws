@@ -444,21 +444,25 @@ export class Table {
 }
 
 /**
- * Whether a query failed because the table has no index `indexName`:
+ * Whether a query failed because the table has no index `indexName`.
  * DynamoDB answers `ValidationException` ("The table does not have the
- * specified index"), moto and LocalStack `ResourceNotFoundException`.
+ * specified index: GSI3") and moto `ResourceNotFoundException` ("Invalid
+ * index: GSI3 for table: ..."), both naming the index; LocalStack answers
+ * `ResourceNotFoundException` "Index not found", without the name. So a
+ * `ResourceNotFoundException` that mentions an index counts even when it
+ * does not name one (the query named a single index), while a missing
+ * table ("non-existent table", "Requested resource not found") does not.
  */
 function isMissingIndex(error: unknown, indexName: string): boolean {
   const { name, message } = (error ?? {}) as {
     name?: string;
     message?: string;
   };
-  return (
-    (name === 'ValidationException' || name === 'ResourceNotFoundException') &&
-    typeof message === 'string' &&
-    /index/i.test(message) &&
-    message.includes(indexName)
-  );
+  if (typeof message !== 'string' || !/\bindex(es)?\b/i.test(message)) {
+    return false;
+  }
+  if (name === 'ResourceNotFoundException') return true;
+  return name === 'ValidationException' && message.includes(indexName);
 }
 
 function withTable(entry: object, tableName: string): object {
