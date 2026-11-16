@@ -36,7 +36,8 @@
   "sideEffects": false,
   "files": [
     "dist",
-    "docs/iam-policy.json"
+    "docs/iam-policy.json",
+    "CHANGELOG.md"
   ],
   "publishConfig": {
     "access": "public"
@@ -52,7 +53,8 @@
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "bootstrap:local": "tsx scripts/bootstrap-local.ts",
-    "changeset": "changeset"
+    "changeset": "changeset",
+    "prepublishOnly": "pnpm build"
   },
   "packageManager": "pnpm@10.30.3",
   "pnpm": {
