@@ -4,6 +4,7 @@ import { DEFAULT_RETRY, type RetryOptions } from './commit.js';
 import type { StorageContext } from './context.js';
 import { createEventsStorage } from './events.js';
 import { createHooksStorage } from './hooks.js';
+import type { PayloadStore } from './payloads.js';
 import { createRunsStorage } from './runs.js';
 import { createSnapshotsStorage } from './snapshots.js';
 import { createStepsStorage } from './steps.js';
@@ -14,6 +15,11 @@ export interface StorageOptions {
   tableName: string;
   /** Retries of a write that loses a race; see `commit.ts`. */
   retry?: Partial<RetryOptions>;
+  /**
+   * Where values too large for an item go (S3). Without one, a write that
+   * does not fit is refused with `PayloadTooLargeError`.
+   */
+  payloads?: PayloadStore;
 }
 
 /**
@@ -32,7 +38,7 @@ export const STORAGE_CAPABILITIES = {
 /** The World's storage over one DynamoDB table. */
 export function createStorage(options: StorageOptions): Storage {
   const context: StorageContext = {
-    table: new Table(options.documents, options.tableName),
+    table: new Table(options.documents, options.tableName, options.payloads),
     retry: { ...DEFAULT_RETRY, ...options.retry },
   };
   return {

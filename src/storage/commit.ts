@@ -35,11 +35,7 @@ import {
   eventKey,
   runMetaKey,
 } from '../keys.js';
-import {
-  DYNAMODB_ITEM_BYTES,
-  MAX_ITEM_BYTES,
-  PayloadTooLargeError,
-} from './errors.js';
+import { DYNAMODB_ITEM_BYTES, PayloadTooLargeError } from './errors.js';
 import type { Item } from './items.js';
 import { debugLog } from './log.js';
 import {
@@ -48,7 +44,7 @@ import {
   type Table,
   type TransactItem,
 } from './table.js';
-import { sizeOf, toStorable } from './values.js';
+import { toStorable } from './values.js';
 
 /** A run's counters as a decision read them. */
 export interface RunState {
@@ -207,11 +203,11 @@ export async function commit<R>(
       const reasons = cancellationReasons(error);
       if (reasons === undefined) throw error;
       if (itemTooLarge(error)) {
-        throw new PayloadTooLargeError(
-          `An item of ${what}`,
-          undefined,
-          DYNAMODB_ITEM_BYTES
-        );
+        throw new PayloadTooLargeError(`An item of ${what}`, undefined, {
+          limit: DYNAMODB_ITEM_BYTES,
+          where: 'DynamoDB accepts in one item',
+          offloaded: table.payloads?.enabled === true,
+        });
       }
       // No reasons at all: an emulator that does not report them. Deciding
       // again is always safe; a permanent error then exhausts the attempts.
@@ -221,11 +217,15 @@ export async function commit<R>(
       ) {
         throw error;
       }
-      failure = { reasons: new Map() };
-      tagged.forEach((entry, index) => {
+      const next: Failure = { reasons: new Map() };
+      for (const [index, entry] of tagged.entries()) {
         const reason = reasonAt(error, index);
-        if (entry.tag && reason) failure?.reasons.set(entry.tag, reason);
-      });
+        if (!entry.tag || !reason) continue;
+        // The item a condition saw may reference payloads in S3.
+        if (reason.item) reason.item = await table.resolve(reason.item);
+        next.reasons.set(entry.tag, reason);
+      }
+      failure = next;
       continue;
     }
 
@@ -298,15 +298,6 @@ function appendItems(
     return items;
   }
 
-  // The run item carries input, output, error, attributes and the start
-  // Hook together: an update can grow it over the limit although every
-  // value fits on its own.
-  if (append.set && state.item) {
-    const size = sizeOf({ ...state.item, ...(toStorable(append.set) as Item) });
-    if (size > MAX_ITEM_BYTES) {
-      throw new PayloadTooLargeError(`The run item of ${runId}`, size);
-    }
-  }
   const { set, remove } = withActiveRunIndex(append);
   const names: Record<string, string> = { '#rev': 'rev' };
   const values: Record<string, unknown> = {
@@ -320,16 +311,25 @@ function appendItems(
     values[':seqInBand'] = seqInBand;
     sets.push('#seq = :seq', '#seqInBand = :seqInBand');
   }
+  // The run item carries input, output, error, attributes and the start
+  // Hook together: an update can grow it over the limit although every
+  // value fits on its own. The table moves what does not fit to S3 (or
+  // refuses the write), given the item as it will be.
+  const projected: Item = { ...state.item };
+  const placeholders: Record<string, string> = {};
   let n = 0;
   for (const [name, value] of Object.entries(set ?? {})) {
     if (value === undefined) continue;
     names[`#a${n}`] = name;
     values[`:a${n}`] = toStorable(value);
+    projected[name] = values[`:a${n}`];
+    placeholders[name] = `:a${n}`;
     sets.push(`#a${n} = :a${n}`);
     n++;
   }
   const removes = (remove ?? []).map((name) => {
     names[`#a${n}`] = name;
+    delete projected[name];
     return `#a${n++}`;
   });
   let condition: string;
@@ -348,6 +348,9 @@ function appendItems(
         ConditionExpression: condition,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
+        ...(state.item && {
+          offload: { item: projected, values: placeholders },
+        }),
       },
     },
   });

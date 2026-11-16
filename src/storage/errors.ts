@@ -44,9 +44,10 @@ export class MissingTableIndexError extends WorkflowWorldError {
 
 /**
  * A write would store an item over {@link MAX_ITEM_BYTES} (a large step
- * input or output, run input, hook payload or VM snapshot). Moving such
- * payloads to S3 is planned; until then the write is refused before it
- * reaches DynamoDB, and nothing is written.
+ * input or output, run input, hook payload, VM snapshot or stream chunk),
+ * a transaction over DynamoDB's 4 MB, or a queue message over SQS's size,
+ * and the World cannot move enough of it to S3: no bucket is configured, or
+ * what is left does not fit either. Nothing is written or sent.
  */
 export class PayloadTooLargeError extends WorkflowWorldError {
   /** The size, when the World measured it (not when DynamoDB refused). */
@@ -56,10 +57,26 @@ export class PayloadTooLargeError extends WorkflowWorldError {
   constructor(
     what: string,
     bytes: number | undefined,
-    limit: number = MAX_ITEM_BYTES
+    options: {
+      /** Default {@link MAX_ITEM_BYTES}. */
+      limit?: number;
+      /** What the limit is; default "the AWS World stores in one DynamoDB item". */
+      where?: string;
+      /** Whether the large values went to S3 already (a bucket is set). */
+      offloaded?: boolean;
+    } = {}
   ) {
+    const limit = options.limit ?? MAX_ITEM_BYTES;
+    const where =
+      options.where ??
+      (limit === MAX_TRANSACTION_BYTES
+        ? 'DynamoDB accepts in one transaction'
+        : 'the AWS World stores in one DynamoDB item');
+    const advice = options.offloaded
+      ? 'It does not fit even with its large values stored in S3.'
+      : 'Payloads this large are stored in S3: configure a bucket with the `bucket` option of createWorld() or the WORKFLOW_AWS_BUCKET environment variable.';
     super(
-      `${what} is ${bytes === undefined ? 'larger than DynamoDB accepts' : `${bytes} bytes`}, over the ${limit} bytes the AWS World stores in one DynamoDB item. Payloads this large need S3 offload, which this version does not have yet.`,
+      `${what} is ${bytes === undefined ? 'larger than DynamoDB accepts' : `${bytes} bytes`}, over the ${limit} bytes ${where}. ${advice}`,
       { status: 413, code: PAYLOAD_TOO_LARGE_CODE }
     );
     this.name = 'PayloadTooLargeError';

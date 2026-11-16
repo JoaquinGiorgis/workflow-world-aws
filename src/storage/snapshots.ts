@@ -13,8 +13,8 @@ import { fromStorable } from './values.js';
  * pairs one suspension's bytes with another's metadata. `eventsCursor` and
  * `createdAt` are copied next to it for inspection only.
  *
- * Snapshots over the item limit fail with `PayloadTooLargeError` until the
- * S3 offload lands.
+ * A snapshot over the item limit goes to S3 (`payloads.ts`); saving a new
+ * one deletes the object of the one it replaces.
  */
 export function createSnapshotsStorage(
   table: Table
