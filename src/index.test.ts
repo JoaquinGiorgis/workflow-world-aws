@@ -161,6 +161,109 @@ describe('createWorld', () => {
     }
   });
 
+  describe('when recovery fails', () => {
+    const missingIndex = (name: string, message: string) =>
+      Object.assign(new Error(message), { name });
+    const activeRun = {
+      PK: 'RUN#wrun_01JD000000000000000000000A',
+      SK: 'META',
+      runId: 'wrun_01JD000000000000000000000A',
+      status: 'running',
+      deploymentId: 'aws',
+      workflowName: 'wf',
+      specVersion: 8,
+      input: new Uint8Array(),
+      createdAt: '2026-11-15T20:00:00.000Z',
+      updatedAt: '2026-11-15T20:00:00.000Z',
+    };
+
+    it.each([
+      [
+        'DynamoDB',
+        'ValidationException',
+        'The table does not have the specified index: GSI3',
+      ],
+      [
+        'moto',
+        'ResourceNotFoundException',
+        'Invalid index: GSI3 for table: workflow. Available indexes are: GSI1, GSI2',
+      ],
+    ])(
+      'names the missing GSI3 and how to add it (%s)',
+      async (_, name, message) => {
+        const clients = createClients(options);
+        const ddb = mockClient(clients.documents);
+        ddb.on(QueryCommand).rejects(missingIndex(name, message));
+        const world = createWorld({ ...options, clients });
+        try {
+          const listing = world.runs.list({ status: 'running' });
+          await expect(listing).rejects.toMatchObject({
+            name: 'MissingTableIndexError',
+            indexName: 'GSI3',
+            tableName: 'workflow',
+          });
+          await expect(listing).rejects.toThrow(
+            /table "workflow" has no index "GSI3"/
+          );
+          await expect(listing).rejects.toThrow(/bootstrap:local/);
+          await expect(listing).rejects.toThrow(/UpdateTable/);
+        } finally {
+          await world.close();
+          ddb.restore();
+          destroyClients(clients);
+        }
+      }
+    );
+
+    it('does not start the worker, and the next start() recovers', async () => {
+      const clients = createClients(options);
+      const ddb = mockClient(clients.documents);
+      const sqs = mockClient(clients.sqs);
+      ddb
+        .on(QueryCommand)
+        .rejectsOnce(
+          missingIndex(
+            'ProvisionedThroughputExceededException',
+            'Throughput exceeds the current capacity of your table or index'
+          )
+        )
+        .resolves({ Items: [activeRun] });
+      sqs.on(SendMessageCommand).resolves({});
+      sqs.on(ReceiveMessageCommand).callsFake(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return {};
+      });
+      const world = createWorld({
+        ...options,
+        workflowQueueUrl: `${options.workflowQueueUrl}-failed-recovery`,
+        clients,
+        pollWaitSeconds: 0,
+      });
+      try {
+        await expect(world.start()).rejects.toThrow(/Throughput exceeds/);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(sqs.commandCalls(ReceiveMessageCommand)).toHaveLength(0);
+        expect(sqs.commandCalls(SendMessageCommand)).toHaveLength(0);
+
+        await world.start();
+        expect(sqs.commandCalls(SendMessageCommand)).toHaveLength(1);
+        await vi.waitFor(() =>
+          expect(
+            sqs.commandCalls(ReceiveMessageCommand).length
+          ).toBeGreaterThan(0)
+        );
+        // Recovered once: a later start() does nothing more.
+        await world.start();
+        expect(sqs.commandCalls(SendMessageCommand)).toHaveLength(1);
+      } finally {
+        await world.close();
+        ddb.restore();
+        sqs.restore();
+        destroyClients(clients);
+      }
+    });
+  });
+
   it('closes once', async () => {
     const world = createWorld(options);
     const first = world.close();

@@ -1,8 +1,13 @@
 import {
   CreateTableCommand,
   DescribeTableCommand,
+  type DescribeTableCommandOutput,
   DynamoDBClient,
+  type IndexStatus,
   ResourceInUseException,
+  ScanCommand,
+  UpdateItemCommand,
+  UpdateTableCommand,
   UpdateTimeToLiveCommand,
 } from '@aws-sdk/client-dynamodb';
 import {
@@ -16,7 +21,7 @@ import {
   SQSClient,
 } from '@aws-sdk/client-sqs';
 import { mockClient } from 'aws-sdk-client-mock';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createClients, destroyClients } from '../src/clients.js';
 import {
   type BootstrapOptions,
@@ -49,9 +54,16 @@ beforeEach(() => {
   s3.reset();
 
   dynamodb.on(CreateTableCommand).resolves({});
-  dynamodb
-    .on(DescribeTableCommand)
-    .resolves({ Table: { TableName: 'workflow', TableStatus: 'ACTIVE' } });
+  dynamodb.on(DescribeTableCommand).resolves({
+    Table: {
+      TableName: 'workflow',
+      TableStatus: 'ACTIVE',
+      GlobalSecondaryIndexes: ['GSI1', 'GSI2', 'GSI3'].map((IndexName) => ({
+        IndexName,
+        IndexStatus: 'ACTIVE',
+      })),
+    },
+  });
   dynamodb.on(UpdateTimeToLiveCommand).resolves({});
   sqs.on(CreateQueueCommand).callsFake((input: { QueueName: string }) => ({
     QueueUrl: queueUrl(input.QueueName),
@@ -194,6 +206,129 @@ describe('bootstrapLocal', () => {
     await expect(bootstrapLocal({ ...base, clients })).resolves.toMatchObject({
       tableName: 'workflow',
     });
+  });
+
+  it('keeps the GSIs of a table that has them all', async () => {
+    dynamodb
+      .on(CreateTableCommand)
+      .rejects(
+        new ResourceInUseException({ message: 'Table exists', $metadata: {} })
+      );
+
+    await bootstrapLocal({ ...base, clients });
+
+    expect(dynamodb.commandCalls(UpdateTableCommand)).toHaveLength(0);
+    expect(dynamodb.commandCalls(ScanCommand)).toHaveLength(0);
+  });
+
+  it('adds GSI3 to a table created before it, waits for it and backfills the active runs', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true, advanceTimeDelta: 50 });
+    try {
+      dynamodb
+        .on(CreateTableCommand)
+        .rejects(
+          new ResourceInUseException({ message: 'Table exists', $metadata: {} })
+        );
+      const table = (
+        indexes: [string, IndexStatus][]
+      ): DescribeTableCommandOutput => ({
+        $metadata: {},
+        Table: {
+          TableName: 'workflow',
+          TableStatus: 'ACTIVE',
+          GlobalSecondaryIndexes: indexes.map(([IndexName, IndexStatus]) => ({
+            IndexName,
+            IndexStatus,
+          })),
+        },
+      });
+      const before: [string, IndexStatus][] = [
+        ['GSI1', 'ACTIVE'],
+        ['GSI2', 'ACTIVE'],
+      ];
+      dynamodb
+        .on(DescribeTableCommand)
+        .resolvesOnce(table(before))
+        .resolvesOnce(table(before))
+        .resolvesOnce(table([...before, ['GSI3', 'CREATING']]))
+        .resolves(table([...before, ['GSI3', 'ACTIVE']]));
+      dynamodb.on(UpdateTableCommand).resolves({});
+      const meta = (runId: string, status: string, extra = {}) => ({
+        PK: { S: `RUN#${runId}` },
+        SK: { S: 'META' },
+        runId: { S: runId },
+        status: { S: status },
+        ...extra,
+      });
+      dynamodb
+        .on(ScanCommand)
+        .resolvesOnce({
+          Items: [meta('wrun_A', 'running')],
+          LastEvaluatedKey: { PK: { S: 'RUN#wrun_A' }, SK: { S: 'META' } },
+        })
+        .resolves({ Items: [meta('wrun_B', 'pending')] });
+      dynamodb.on(UpdateItemCommand).resolves({});
+
+      await bootstrapLocal({ ...base, clients });
+
+      const [update] = dynamodb.commandCalls(UpdateTableCommand);
+      expect(update?.args[0].input).toEqual({
+        TableName: 'workflow',
+        AttributeDefinitions: [
+          { AttributeName: 'GSI3PK', AttributeType: 'S' },
+          { AttributeName: 'GSI3SK', AttributeType: 'S' },
+        ],
+        GlobalSecondaryIndexUpdates: [
+          {
+            Create: {
+              IndexName: 'GSI3',
+              KeySchema: [
+                { AttributeName: 'GSI3PK', KeyType: 'HASH' },
+                { AttributeName: 'GSI3SK', KeyType: 'RANGE' },
+              ],
+              Projection: { ProjectionType: 'ALL' },
+            },
+          },
+        ],
+      });
+      // Waited until the index was ACTIVE.
+      expect(
+        dynamodb.commandCalls(DescribeTableCommand).length
+      ).toBeGreaterThanOrEqual(4);
+
+      // The backfill scans the run items that have not ended and puts each
+      // in GSI3, unless it ended or got the attributes meanwhile.
+      const scans = dynamodb.commandCalls(ScanCommand);
+      expect(scans).toHaveLength(2);
+      expect(scans[0]?.args[0].input.FilterExpression).toContain(
+        'attribute_not_exists(GSI3PK)'
+      );
+      expect(scans[1]?.args[0].input.ExclusiveStartKey).toEqual({
+        PK: { S: 'RUN#wrun_A' },
+        SK: { S: 'META' },
+      });
+      const updates = dynamodb
+        .commandCalls(UpdateItemCommand)
+        .map((call) => call.args[0].input);
+      expect(updates.map((input) => input.Key)).toEqual([
+        { PK: { S: 'RUN#wrun_A' }, SK: { S: 'META' } },
+        { PK: { S: 'RUN#wrun_B' }, SK: { S: 'META' } },
+      ]);
+      expect(updates[0]?.UpdateExpression).toBe(
+        'SET GSI3PK = :pk, GSI3SK = :runId'
+      );
+      expect(updates[0]?.ExpressionAttributeValues?.[':pk']).toEqual({
+        S: 'ACTIVE',
+      });
+      expect(updates[0]?.ExpressionAttributeValues?.[':runId']).toEqual({
+        S: 'wrun_A',
+      });
+      expect(updates[0]?.ConditionExpression).toContain(
+        'attribute_not_exists(GSI3PK)'
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('surfaces any other error', async () => {
