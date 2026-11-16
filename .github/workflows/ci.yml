@@ -42,9 +42,16 @@ jobs:
       - name: Check package contents
         run: pnpm pack --dry-run
 
-  integration:
+  # The whole integration suite (storage, queue, streams, S3 offload and
+  # @workflow/world-testing at spec 8 and 9) against LocalStack. Newer
+  # LocalStack images may refuse to start without an auth token: then set
+  # the LOCALSTACK_AUTH_TOKEN repository secret. Secrets cannot gate a job,
+  # so it runs only when the repository variable LOCALSTACK_ENABLED is
+  # "true"; the moto job below runs the same suite without any token.
+  integration-localstack:
     name: Integration tests (LocalStack)
     runs-on: ubuntu-latest
+    if: ${{ vars.LOCALSTACK_ENABLED == 'true' }}
     services:
       localstack:
         image: localstack/localstack:4
@@ -52,16 +59,18 @@ jobs:
           - 4566:4566
         env:
           SERVICES: dynamodb,sqs,s3
-          # Only needed if the image in use requires an account token.
           LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
         options: >-
           --health-cmd "curl -fs http://localhost:4566/_localstack/health"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 20
+          --health-retries 30
     env:
       WORKFLOW_AWS_ENDPOINT: http://localhost:4566
       WORKFLOW_AWS_REGION: us-east-1
+      # Never take LocalStack for moto: the storage suites then send their
+      # DynamoDB requests concurrently, as against DynamoDB.
+      WORKFLOW_AWS_EMULATOR: localstack
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -72,4 +81,29 @@ jobs:
       - run: pnpm install --frozen-lockfile
       # The global setup finds LocalStack already answering, so it does not
       # start moto_server. It sets dummy credentials itself.
+      - run: pnpm test:integration
+
+  # The same suite against moto_server, which needs no account or token.
+  integration-moto:
+    name: Integration tests (moto_server)
+    runs-on: ubuntu-latest
+    env:
+      WORKFLOW_AWS_ENDPOINT: http://localhost:4566
+      WORKFLOW_AWS_REGION: us-east-1
+      WORKFLOW_AWS_EMULATOR: moto
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install moto_server
+        run: pip install "moto[server]"
+      - name: Enable corepack
+        run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      # Nothing answers at the endpoint, so the global setup starts
+      # moto_server (on PATH after pip install) and stops it afterwards.
       - run: pnpm test:integration
