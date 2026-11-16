@@ -249,7 +249,8 @@ export class Consumer {
 
   private log(message: string, detail?: Record<string, unknown>): void {
     if (this.options.log) this.options.log(message, detail);
-    else console.warn(`[world-aws] ${message}`, detail ?? '');
+    else if (detail === undefined) console.warn(`[world-aws] ${message}`);
+    else console.warn(`[world-aws] ${message}`, detail);
   }
 
   private async poll(queueUrl: string, slots: Slots): Promise<void> {

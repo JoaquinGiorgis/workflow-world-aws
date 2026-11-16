@@ -130,7 +130,9 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
   const log =
     options.internal?.log ??
     ((message: string, detail?: Record<string, unknown>) =>
-      console.warn(`[world-aws] ${message}`, detail ?? ''));
+      detail === undefined
+        ? console.warn(`[world-aws] ${message}`)
+        : console.warn(`[world-aws] ${message}`, detail));
   const idempotency = new IdempotencyStore(
     options.documents,
     options.tableName,
