@@ -105,13 +105,18 @@ output.
 
 ```bash
 pnpm install && pnpm build
-sam build                 # bundles src/lambda.ts with esbuild
+sam build --build-in-source   # bundles src/lambda.ts with esbuild
 sam deploy --guided
 ```
 
-`sam build` bundles the published package from `node_modules`; to deploy
-the example as is, the root package has to be built first (it is linked
-with `link:../..`), or replace the link with a version from npm.
+By default `sam build` copies the function's directory and runs `npm
+install` there before bundling. That is expected to fail on this
+example: `@joaquingiorgis/world-aws` is declared as `link:../..`, a pnpm
+protocol npm does not understand, and there is no `package-lock.json`.
+Either build in place with `--build-in-source`, so esbuild bundles from
+the `node_modules` pnpm installed (the root package built first, since it
+is linked), or replace `link:../..` in `package.json` with a version from
+npm before `sam build`. Neither has been tried (see below).
 
 The `api` function awaits `world.settled()` before answering, so the
 idempotency keys of the messages it sent are marked sent before Lambda

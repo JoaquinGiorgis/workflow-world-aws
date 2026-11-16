@@ -36,13 +36,15 @@ See [Status](#status) for what has and has not been tested.
 ## Install
 
 ```bash
-pnpm add @joaquingiorgis/world-aws
-# or: npm install @joaquingiorgis/world-aws
+pnpm add @joaquingiorgis/world-aws @workflow/world
+# or: npm install @joaquingiorgis/world-aws @workflow/world
 ```
 
-Requires Node.js 22 or later and `@workflow/world` 5.2 or later (a peer
-dependency, installed with the `workflow` package). The AWS SDK v3 clients
-for DynamoDB, SQS and S3 come as dependencies.
+Requires Node.js 22 or later and `@workflow/world` 5.2 or later, a peer
+dependency. The `workflow` package brings it only through `@workflow/core`,
+so add it yourself, at the version your `workflow` uses. This release was
+tested with `@workflow/world` 5.2.0. The AWS SDK v3 clients for DynamoDB,
+SQS and S3 come as dependencies.
 
 The package is ESM only. `import` it (the Workflow runtime loads Worlds
 with `import()`); `require()` from CommonJS works from Node.js 22.12 on.
@@ -160,7 +162,10 @@ Three ways to create them:
   without an endpoint, so it never touches a real account.
 - **SAM.** [`examples/hono/template.yaml`](examples/hono/template.yaml)
   creates all of them plus a Lambda deployment. Copy the resources you
-  need.
+  need. The example depends on this package through `link:../..`, which
+  npm does not understand, so `sam build` has to run with
+  `--build-in-source`, or with the link replaced by a version from npm
+  (see [its README](examples/hono/README.md#deploy-it-with-sam)).
 - **By hand or with your own IaC**, following the table above.
 
 ## Worker mode and Lambda mode
@@ -457,7 +462,8 @@ With a bucket, what does not fit DynamoDB or SQS goes to S3:
 - **Item values.** When an item would be over 350 KB, or a transaction over
   4 MB less a 256 KB margin, its largest values (never keys, counters or
   attributes a condition reads) are written to
-  `s3://<bucket>/<runId>/<kind>/<id>/<attribute>-<sha256>` (`kind` is
+  `s3://<bucket>/<runId>/<kind>/<id>/<attribute>-<hash>` (`<hash>` is the
+  first 40 hex digits of the value's SHA-256; `kind` is
   `run`, `event`, `step`, `hook`, `wait`, `snapshot` or `stream`; a stream
   chunk's `<id>` is `<stream name>/<position>`), and the item keeps a
   reference `{ s3Ref, s3Encoding, s3Bytes }`. Reads resolve it
@@ -467,7 +473,8 @@ With a bucket, what does not fit DynamoDB or SQS goes to S3:
   replacing a snapshot deletes the old object. A World without a bucket
   still reads references written by one that had it.
 - **Queue messages.** A message over 256 KiB is written whole to
-  `s3://<bucket>/queue/<runId>/<messageId>/<ulid>-<sha256>`; its SQS body
+  `s3://<bucket>/queue/<runId>/<messageId>/<ulid>-<hash>` (the same
+  40 hex digits of the SHA-256); its SQS body
   carries only the ids and the reference. The object is deleted once the
   message is handled.
 - **Retention.** A run's objects stay as long as its items. Objects of
@@ -502,8 +509,10 @@ With a bucket, what does not fit DynamoDB or SQS goes to S3:
   whose sender died is taken over after 10 minutes, under the same id,
   which is well past the 130 seconds an SQS request can take, so a sender
   that is still sending is not overtaken; one that was overtaken anyway
-  logs a warning, since the message may then be in the queue twice. Keys
-  are kept for 24 hours (`expiresAt`, DynamoDB TTL).
+  logs a warning, since the message may then be in the queue twice. Until
+  then, a send under a key whose sender died does not answer: it waits,
+  checking every 100 ms, until the reservation is 10 minutes old, and then
+  takes it over. Keys are kept for 24 hours (`expiresAt`, DynamoDB TTL).
 - **Recovery.** `start()` sends a message for every run that has not ended
   (`reenqueueActiveRuns`), as world-postgres does, in case the one that
   would continue it was lost. With SQS the queue outlives the process, so
@@ -596,8 +605,9 @@ update per run, safe to run again) with the clients you pass it.
 variable is missing or a value is invalid; the message lists each problem
 and the variable or option to set.
 
-**`MissingTableIndexError: table "…" has no index "GSI3"`.** The table was
-created without GSI3. See [Upgrading a table](#upgrading-a-table-without-gsi3).
+**`MissingTableIndexError: The DynamoDB table "…" has no index "GSI3"`.**
+The table was created without GSI3. See
+[Upgrading a table](#upgrading-a-table-without-gsi3).
 
 **`PayloadTooLargeError` (413).** A value or queue message does not fit
 DynamoDB or SQS and no bucket is configured. Set `WORKFLOW_AWS_BUCKET`.
@@ -606,6 +616,15 @@ DynamoDB or SQS and no bucket is configured. Set `WORKFLOW_AWS_BUCKET`.
 does not exist (the name is wrong), or it is in another region than
 `WORKFLOW_AWS_REGION` (S3 answered `PermanentRedirect`); the message says
 which.
+
+**A send, or a Lambda record, hangs for minutes and then goes through.**
+It sends under an idempotency key whose earlier sender died (or was frozen
+by Lambda) between reserving the key and marking it sent, and waits until
+that reservation is 10 minutes old to take it over (see Idempotency under
+[Queue](#queue)). In Lambda mode the function times out and the batch
+comes back after the queue's visibility timeout, until those 10 minutes
+are up. Functions that send should await `world.settled()` before
+answering.
 
 **`AccessDeniedException` / `AccessDenied`.** The role misses an action of
 the [IAM policy](#iam), often `dynamodb:Query` on `table/<table>/index/*`
