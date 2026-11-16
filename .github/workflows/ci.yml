@@ -44,6 +44,29 @@ jobs:
       - name: Check package contents
         run: pnpm pack --dry-run
 
+  # The Hono example builds against this package, typechecks, and its SAM
+  # template has what the World needs. It has its own lockfile.
+  example:
+    name: Example (Hono, SAM template)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Enable corepack
+        run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm install --frozen-lockfile
+        working-directory: examples/hono
+      - run: pnpm build
+        working-directory: examples/hono
+      - run: pnpm typecheck
+        working-directory: examples/hono
+      - run: pnpm test:template
+        working-directory: examples/hono
+
   # The whole integration suite (storage, queue, streams, S3 offload and
   # @workflow/world-testing at spec 8 and 9) against LocalStack, on every
   # run: unlike moto, LocalStack runs a TransactWriteItems in isolation, as
