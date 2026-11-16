@@ -1,7 +1,14 @@
+import { TransactionCanceledException } from '@aws-sdk/client-dynamodb';
+import {
+  GetCommand,
+  QueryCommand,
+  TransactWriteCommand,
+} from '@aws-sdk/lib-dynamodb';
 import {
   SPEC_VERSION_DEFAULT_MINTED,
   SPEC_VERSION_SINGLE_ORCHESTRATOR,
 } from '@workflow/world';
+import { mockClient } from 'aws-sdk-client-mock';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AwsWorldConfigError,
@@ -88,6 +95,54 @@ describe('createWorld (M1)', () => {
       expect(call).toThrow(`${method} is not implemented yet (${milestone})`);
     }
     await world.close?.();
+  });
+
+  it('passes `retry` to the storage', async () => {
+    const clients = createClients(options);
+    const ddb = mockClient(clients.documents);
+    ddb.on(GetCommand).resolves({});
+    ddb.on(GetCommand, { Key: { PK: 'RUN#wrun_A', SK: 'META' } }).resolves({
+      Item: {
+        PK: 'RUN#wrun_A',
+        SK: 'META',
+        runId: 'wrun_A',
+        status: 'running',
+        deploymentId: 'd',
+        workflowName: 'w',
+        specVersion: 8,
+        createdAt: '2026-11-15T20:00:00.000Z',
+        updatedAt: '2026-11-15T20:00:00.000Z',
+        seq: 1,
+        seqInBand: 1,
+        rev: 1,
+      },
+    });
+    ddb.on(QueryCommand).resolves({ Items: [] });
+    ddb.on(TransactWriteCommand).rejects(
+      new TransactionCanceledException({
+        message: 'Transaction cancelled',
+        $metadata: {},
+        CancellationReasons: [{ Code: 'ConditionalCheckFailed' }],
+      })
+    );
+    const world = createWorld({
+      ...options,
+      clients,
+      retry: { maxAttempts: 2, immediateAttempts: 2 },
+    });
+    try {
+      await expect(
+        world.events.create('wrun_A', {
+          eventType: 'wait_created',
+          correlationId: 'wait_1',
+          eventData: { resumeAt: new Date() },
+        })
+      ).rejects.toMatchObject({ name: 'WorkflowWorldError', status: 503 });
+      expect(ddb.commandCalls(TransactWriteCommand)).toHaveLength(2);
+    } finally {
+      ddb.restore();
+      destroyClients(clients);
+    }
   });
 
   it('leaves clients it was given open on close', async () => {

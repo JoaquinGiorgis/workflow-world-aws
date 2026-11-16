@@ -44,6 +44,7 @@ export function createStorage(options: StorageOptions): Storage {
   };
 }
 
+export type { RetryOptions } from './commit.js';
 export {
   MAX_ITEM_BYTES,
   PAYLOAD_TOO_LARGE_CODE,

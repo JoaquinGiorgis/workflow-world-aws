@@ -1,7 +1,11 @@
 import { mintedSpecVersion, type World } from '@workflow/world';
 import { type AwsClients, createClients, destroyClients } from './clients.js';
 import { type AwsWorldOptions, resolveConfig } from './config.js';
-import { createStorage, STORAGE_CAPABILITIES } from './storage/index.js';
+import {
+  createStorage,
+  type RetryOptions,
+  STORAGE_CAPABILITIES,
+} from './storage/index.js';
 
 export interface CreateWorldOptions extends AwsWorldOptions {
   /**
@@ -11,6 +15,13 @@ export interface CreateWorldOptions extends AwsWorldOptions {
    * describe where they point.
    */
   clients?: AwsClients;
+  /**
+   * How a write that loses a race with another writer of the same run is
+   * retried: by default 40 attempts, the first two at once and then with
+   * exponential backoff and full jitter capped at 250 ms, after which it
+   * fails with a 503 `WorkflowWorldError`.
+   */
+  retry?: Partial<RetryOptions>;
 }
 
 /** Thrown by the queue (until M2) and stream (until M3) methods. */
@@ -57,6 +68,7 @@ export function createWorld(options: CreateWorldOptions = {}): World {
     ...createStorage({
       documents: clients.documents,
       tableName: config.tableName,
+      ...(options.retry && { retry: options.retry }),
     }),
 
     getDeploymentId: notImplemented('getDeploymentId', 'M2'),
@@ -91,4 +103,5 @@ export {
   MAX_ITEM_BYTES,
   PAYLOAD_TOO_LARGE_CODE,
   PayloadTooLargeError,
+  type RetryOptions,
 } from './storage/index.js';
