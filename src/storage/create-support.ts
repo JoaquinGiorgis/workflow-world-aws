@@ -11,6 +11,10 @@ import type {
   Wait,
   WorkflowRun,
 } from '@workflow/world';
+import {
+  hookRetentionLimitDays,
+  hookRetentionLimitProblem,
+} from '../config.js';
 import { hookIdKey, hookKey, hookTokenKey, PREFIX, runPk } from '../keys.js';
 import type {
   Append,
@@ -38,14 +42,16 @@ export interface Outcome {
   allocated: number;
 }
 
-/** `WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS`, 30 by default. */
+/**
+ * `WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS`, 30 by default. `createWorld()`
+ * validated it already; read here so a change after that still counts.
+ */
 export function hookRetentionLimitMs(): number {
-  const days = Number(process.env.WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS ?? 30);
-  if (!Number.isFinite(days) || days <= 0) {
-    throw new WorkflowWorldError(
-      'WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS must be a positive number',
-      { status: 400 }
-    );
+  const days = hookRetentionLimitDays(process.env);
+  if (days === undefined) {
+    throw new WorkflowWorldError(hookRetentionLimitProblem(process.env), {
+      status: 400,
+    });
   }
   return days * DAY_MS;
 }

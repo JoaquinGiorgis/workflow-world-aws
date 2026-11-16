@@ -180,6 +180,33 @@ describe('resolveConfig', () => {
     expect(problems[0]).toContain(JSON.stringify(value));
   });
 
+  it.each(['', '   ', '60', '0.5'])(
+    'accepts WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS=%j',
+    (value) => {
+      expect(() =>
+        resolveConfig({
+          ...validEnv,
+          WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS: value,
+        })
+      ).not.toThrow();
+    }
+  );
+
+  it.each(['0', '-1', 'thirty', 'Infinity'])(
+    'rejects WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS=%j',
+    (value) => {
+      const problems = problemsOf(() =>
+        resolveConfig({
+          ...validEnv,
+          WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS: value,
+        })
+      );
+      expect(problems).toEqual([
+        `WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS must be a positive number, got ${JSON.stringify(value)}`,
+      ]);
+    }
+  );
+
   it('reads the delivery base URL and validates it', () => {
     expect(
       resolveConfig({

@@ -52,6 +52,15 @@ describe('createWorld', () => {
     );
   });
 
+  it('validates WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS up front', () => {
+    vi.stubEnv('WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS', 'thirty');
+    expect(() => createWorld(options)).toThrow(
+      /WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS must be a positive number/
+    );
+    vi.stubEnv('WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS', ' ');
+    expect(() => createWorld(options).close()).not.toThrow();
+  });
+
   it('declares the minted spec version', async () => {
     const world = createWorld(options);
     expect(world.specVersion).toBe(SPEC_VERSION_DEFAULT_MINTED);

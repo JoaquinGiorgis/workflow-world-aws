@@ -96,6 +96,30 @@ export const DEFAULTS = {
   recoveryIntervalSeconds: 900,
 } as const;
 
+/**
+ * The longest `experimental_minRetention` a hook may ask for, in days. Not
+ * an option: the storage reads it when a hook is created, and
+ * {@link resolveConfig} validates it up front.
+ */
+const HOOK_RETENTION_LIMIT_ENV = 'WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS';
+const DEFAULT_HOOK_RETENTION_LIMIT_DAYS = 30;
+
+/**
+ * {@link HOOK_RETENTION_LIMIT_ENV} in days: 30 when unset or empty,
+ * `undefined` when it is not a positive number.
+ */
+export function hookRetentionLimitDays(env: Env): number | undefined {
+  const raw = env[HOOK_RETENTION_LIMIT_ENV]?.trim();
+  if (raw === undefined || raw === '') return DEFAULT_HOOK_RETENTION_LIMIT_DAYS;
+  const days = Number(raw);
+  return Number.isFinite(days) && days > 0 ? days : undefined;
+}
+
+/** The problem with an invalid {@link HOOK_RETENTION_LIMIT_ENV}. */
+export function hookRetentionLimitProblem(env: Env): string {
+  return `${HOOK_RETENTION_LIMIT_ENV} must be a positive number, got ${JSON.stringify(env[HOOK_RETENTION_LIMIT_ENV]?.trim())}`;
+}
+
 /** The longest recovery interval: 30 days. */
 const MAX_RECOVERY_INTERVAL_SECONDS = 30 * 24 * 3600;
 
@@ -224,6 +248,9 @@ export function resolveConfig(
     0,
     MAX_RECOVERY_INTERVAL_SECONDS
   );
+  if (hookRetentionLimitDays(env) === undefined) {
+    problems.push(hookRetentionLimitProblem(env));
+  }
 
   if (problems.length > 0) {
     throw new AwsWorldConfigError(problems);
