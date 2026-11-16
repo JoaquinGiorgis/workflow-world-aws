@@ -200,11 +200,11 @@ world.registerHandler('__wkf_workflow_', POST);
 export const handler = createSqsLambdaHandler({ world });
 ```
 
-The handler takes the SQS event and answers `{ batchItemFailures }`. Each
-record goes through the same steps as in the worker: the message id comes
-from the body, `attempt` and `deliveryCount` from `ApproximateReceiveCount`
-plus earlier copies of the message, bodies in S3 are read back, and early
-hops of long delays are sent on. Then:
+The handler takes the SQS event and Lambda's context, and answers
+`{ batchItemFailures }`. Each record goes through the same steps as in the
+worker: the message id comes from the body, `attempt` and `deliveryCount`
+from `ApproximateReceiveCount` plus earlier copies of the message, bodies
+in S3 are read back, and early hops of long delays are sent on. Then:
 
 - a delivery that succeeded is left out of `batchItemFailures`, and Lambda
   deletes the message;
@@ -228,6 +228,21 @@ neither throttling nor expired credentials): then a warning says so and
 only a new process tries again. Before answering, the handler waits for
 the idempotency-key confirmations its deliveries started, since Lambda
 may freeze the process right after.
+
+**The invocation's deadline.** The handler starts no more records of an
+event once fewer than `deadlineMarginMs` milliseconds (default 10000) are
+left, by `context.getRemainingTimeInMillis()`. The records it has not
+started are reported in `batchItemFailures` without a backoff, so Lambda
+deletes the ones that succeeded and redelivers only those, after the
+queue's visibility timeout; without that, a function that times out
+mid-batch gets every record of the batch back, the finished ones too. The
+redelivery counts a receive, so those records see a higher `attempt`. The
+margin is for what follows the last record (the idempotency confirmations,
+a recovery still running), not for a delivery already running: a record
+started with 11 seconds left still runs to its end. Size the function
+timeout for your slowest step plus the margin.
+`createSqsLambdaHandler({ deadlineMarginMs: 5_000 })` changes it; called
+without a context, the handler takes every record.
 
 **Functions that only send.** A function that starts runs or resumes hooks
 (an API behind a function URL or API Gateway) sends some messages with an
@@ -259,7 +274,7 @@ Setting up the mappings:
   in parallel. AWS recommends six times the function timeout.
 - `BatchSize` up to 10 keeps an event's records within one function's
   time. A delivery runs a workflow step inline, so size the function
-  timeout for your slowest step.
+  timeout for your slowest step plus `deadlineMarginMs`.
 - Lambda's receives count towards `maxReceiveCount` too, including when
   the function is throttled. Keep a high value (73 here) and alarm on the
   dead-letter queues.

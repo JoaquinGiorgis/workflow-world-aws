@@ -7,7 +7,11 @@ import {
 import { type AwsClients, createClients, destroyClients } from './clients.js';
 import { type AwsWorldOptions, resolveConfig } from './config.js';
 import { createSqsQueue } from './queue/index.js';
-import type { SqsBatchResponse, SqsLambdaEvent } from './queue/lambda.js';
+import type {
+  SqsBatchResponse,
+  SqsEventDeadline,
+  SqsLambdaEvent,
+} from './queue/lambda.js';
 import { RecoveryGuard } from './recovery.js';
 import {
   createStorage,
@@ -54,10 +58,14 @@ export type AwsWorld = World &
     recover(): Promise<boolean>;
     /**
      * Lambda mode: delivers the records of an SQS event and answers the
-     * ones to leave in the queue. Usually through
-     * {@link createSqsLambdaHandler}.
+     * ones to leave in the queue. Given a `deadline`, it starts no record
+     * once less than its margin is left and reports the rest. Usually
+     * through {@link createSqsLambdaHandler}.
      */
-    handleSqsEvent(event: SqsLambdaEvent): Promise<SqsBatchResponse>;
+    handleSqsEvent(
+      event: SqsLambdaEvent,
+      deadline?: SqsEventDeadline
+    ): Promise<SqsBatchResponse>;
     /**
      * Resolves once the idempotency keys of earlier sends are marked sent.
      * `queue()` answers before that write lands; a process about to be
@@ -224,9 +232,25 @@ export interface SqsLambdaHandlerOptions {
    * whose next message was lost.
    */
   recover?: boolean;
+  /**
+   * Milliseconds of the invocation to keep for answering. Once fewer are
+   * left (Lambda's `context.getRemainingTimeInMillis()`), the handler
+   * starts no more records of the event and reports the rest in
+   * `batchItemFailures`, without a backoff, so Lambda redelivers only them
+   * after the queue's visibility timeout. Default 10000.
+   */
+  deadlineMarginMs?: number;
   /** @internal Test hook: where warnings go. Default `console.warn`. */
   log?: WarnLog;
 }
+
+/** The part of Lambda's context object the handler reads. */
+export interface SqsLambdaContext {
+  getRemainingTimeInMillis?(): number;
+}
+
+/** The default {@link SqsLambdaHandlerOptions.deadlineMarginMs}: 10 s. */
+const DEFAULT_DEADLINE_MARGIN_MS = 10_000;
 
 /**
  * Creates the handler of a Lambda function behind an SQS event source
@@ -248,7 +272,16 @@ export interface SqsLambdaHandlerOptions {
  */
 export function createSqsLambdaHandler(
   options: SqsLambdaHandlerOptions = {}
-): (event: SqsLambdaEvent, context?: unknown) => Promise<SqsBatchResponse> {
+): (
+  event: SqsLambdaEvent,
+  context?: SqsLambdaContext
+) => Promise<SqsBatchResponse> {
+  const marginMs = options.deadlineMarginMs ?? DEFAULT_DEADLINE_MARGIN_MS;
+  if (!Number.isFinite(marginMs) || marginMs < 0) {
+    throw new RangeError(
+      `deadlineMarginMs must be a non-negative number of milliseconds, got ${String(marginMs)}`
+    );
+  }
   const log = options.log ?? warnLog;
   let world: Promise<AwsWorld> | undefined;
   let recovered = options.recover === false;
@@ -278,7 +311,7 @@ export function createSqsLambdaHandler(
     }
   };
 
-  return async (event) => {
+  return async (event, context) => {
     world ??= (async () => {
       const given = options.world;
       return typeof given === 'function' ? given() : (given ?? createWorld());
@@ -287,9 +320,14 @@ export function createSqsLambdaHandler(
       throw error;
     });
     const target = await world;
+    const remaining = context?.getRemainingTimeInMillis;
+    const deadline =
+      typeof remaining === 'function'
+        ? { remainingTimeMs: () => remaining.call(context), marginMs }
+        : undefined;
     // Next to the records, so a long recovery does not hold them up.
     const recovery = recoverOnce(target);
-    const response = await target.handleSqsEvent(event);
+    const response = await target.handleSqsEvent(event, deadline);
     await recovery;
     return response;
   };
@@ -360,6 +398,7 @@ export {
 } from './queue/index.js';
 export type {
   SqsBatchResponse,
+  SqsEventDeadline,
   SqsLambdaEvent,
   SqsLambdaRecord,
 } from './queue/lambda.js';

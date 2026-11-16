@@ -27,7 +27,11 @@
  *
  * A spec 9 run's orchestrator records wait for each other within the
  * process (the same `RunGate` the worker uses), and at most `concurrency`
- * records of an event are delivered at once. Before answering, the handler
+ * records of an event are delivered at once. Given a deadline, no record
+ * is started once less than its margin is left: the records not started
+ * are reported without a backoff, so only they come back (after the queue's
+ * visibility timeout) and the ones that succeeded are not delivered again
+ * when the function would otherwise time out. Before answering, the handler
  * waits for the idempotency confirmations its deliveries started, since
  * Lambda may freeze the process as soon as it answers.
  */
@@ -86,6 +90,16 @@ export interface SqsLambdaEvent {
   Records: SqsLambdaRecord[];
 }
 
+/**
+ * When an invocation has to answer by: the handler starts no record once
+ * fewer than `marginMs` milliseconds are left.
+ */
+export interface SqsEventDeadline {
+  /** Milliseconds the invocation has left (`context.getRemainingTimeInMillis`). */
+  remainingTimeMs: () => number;
+  marginMs: number;
+}
+
 /** What the function answers: the records to leave in the queue. */
 export interface SqsBatchResponse {
   batchItemFailures: { itemIdentifier: string }[];
@@ -119,13 +133,20 @@ export function queueUrlOfArn(
 /** Handles the records of one SQS event; see the module comment. */
 export async function handleSqsEvent(
   options: LambdaDeliveryOptions,
-  event: SqsLambdaEvent
+  event: SqsLambdaEvent,
+  deadline?: SqsEventDeadline
 ): Promise<SqsBatchResponse> {
   const records = event.Records ?? [];
   const failed: string[] = [];
   let next = 0;
+  let remainingMs: number | undefined;
+  const timeIsUp = () => {
+    if (!deadline) return false;
+    remainingMs = deadline.remainingTimeMs();
+    return remainingMs < deadline.marginMs;
+  };
   const lane = async () => {
-    while (next < records.length) {
+    while (next < records.length && !timeIsUp()) {
       const record = records[next++] as SqsLambdaRecord;
       let ok: boolean;
       try {
@@ -152,6 +173,19 @@ export async function handleSqsEvent(
       lane
     )
   );
+  // Not started: left in the queue as they are, without a backoff.
+  const notStarted = records.slice(next);
+  if (notStarted.length > 0) {
+    options.log(
+      'Leaving records of the event for redelivery: the invocation is near its deadline',
+      {
+        records: notStarted.length,
+        remainingMs,
+        marginMs: deadline?.marginMs,
+      }
+    );
+    failed.push(...notStarted.map((record) => record.messageId));
+  }
   // In the order Lambda gave them.
   const order = new Map(records.map((record, i) => [record.messageId, i]));
   failed.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));

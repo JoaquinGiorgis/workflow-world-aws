@@ -456,6 +456,78 @@ describe('createSqsLambdaHandler', () => {
     }
   });
 
+  describe('near the invocation deadline', () => {
+    /** A Lambda context answering these remaining times in turn, then the last. */
+    const context = (remainingMs: number[]) => {
+      const left = [...remainingMs];
+      return {
+        getRemainingTimeInMillis: () =>
+          left.length > 1 ? (left.shift() as number) : (left[0] as number),
+      };
+    };
+
+    it('leaves the records it has not started for redelivery, without a backoff', async () => {
+      const handler = vi.fn(async () => undefined);
+      const lambda = createSqsLambdaHandler({
+        world: world(handler, { concurrency: 1 }),
+        recover: false,
+      });
+      const records = [1, 2, 3].map(() =>
+        record({ payload: { runId: 'wrun_A' } })
+      );
+      // Enough time for the first record, then under the 10 s margin.
+      const response = await lambda(
+        event(...records),
+        context([60_000, 9_999])
+      );
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(response).toEqual({
+        batchItemFailures: [
+          { itemIdentifier: records[1]?.messageId },
+          { itemIdentifier: records[2]?.messageId },
+        ],
+      });
+      expect(sqs.commandCalls(ChangeMessageVisibilityCommand)).toHaveLength(0);
+    });
+
+    it('takes a configurable margin', async () => {
+      const handler = vi.fn(async () => undefined);
+      const lambda = createSqsLambdaHandler({
+        world: world(handler, { concurrency: 1 }),
+        recover: false,
+        deadlineMarginMs: 2_000,
+      });
+      const records = [1, 2].map(() =>
+        record({ payload: { runId: 'wrun_A' } })
+      );
+      expect(await lambda(event(...records), context([9_000, 1_999]))).toEqual({
+        batchItemFailures: [{ itemIdentifier: records[1]?.messageId }],
+      });
+      expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    it('handles every record without a context', async () => {
+      const handler = vi.fn(async () => undefined);
+      const lambda = createSqsLambdaHandler({
+        world: world(handler, { concurrency: 1 }),
+        recover: false,
+      });
+      const records = [1, 2].map(() =>
+        record({ payload: { runId: 'wrun_A' } })
+      );
+      expect(await lambda(event(...records))).toEqual({
+        batchItemFailures: [],
+      });
+      expect(handler).toHaveBeenCalledTimes(2);
+    });
+
+    it('refuses a margin that is not a non-negative number', () => {
+      expect(() => createSqsLambdaHandler({ deadlineMarginMs: -1 })).toThrow(
+        /deadlineMarginMs/
+      );
+    });
+  });
+
   it('tries recovery again on the next event after a throttled query', async () => {
     ddb
       .on(QueryCommand)

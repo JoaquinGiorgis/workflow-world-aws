@@ -51,6 +51,7 @@ import { IdempotencyStore } from './idempotency.js';
 import {
   handleSqsEvent,
   type SqsBatchResponse,
+  type SqsEventDeadline,
   type SqsLambdaEvent,
 } from './lambda.js';
 import {
@@ -128,7 +129,10 @@ export type SqsQueue = Queue &
      * Lambda mode: handles the records of an SQS event source mapping's
      * event and answers the ones to leave in the queue (`lambda.ts`).
      */
-    handleSqsEvent(event: SqsLambdaEvent): Promise<SqsBatchResponse>;
+    handleSqsEvent(
+      event: SqsLambdaEvent,
+      deadline?: SqsEventDeadline
+    ): Promise<SqsBatchResponse>;
     start(): Promise<void>;
     close(): Promise<void>;
   };
@@ -453,7 +457,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
     },
     startWorker,
     canStartWorker,
-    async handleSqsEvent(event) {
+    async handleSqsEvent(event, deadline) {
       const response = await handleSqsEvent(
         {
           sqs,
@@ -467,7 +471,8 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
           }),
           log,
         },
-        event
+        event,
+        deadline
       );
       // Lambda may freeze the process once the function answers.
       await settled();
