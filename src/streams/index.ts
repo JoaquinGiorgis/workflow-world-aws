@@ -316,6 +316,9 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
           return 'retry';
         }
         // Hints only: forgetting them costs a read (or a name put) later.
+        // Clearing both at once is simpler than an LRU: after it, the
+        // next write to each stream pays one tail query, and the first
+        // one puts the stream's name again.
         if (tails.size >= MAX_REMEMBERED_STREAMS) tails.clear();
         if (named.size >= MAX_REMEMBERED_STREAMS) named.clear();
         tails.set(pk, next + group.length);

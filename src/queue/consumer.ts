@@ -31,9 +31,10 @@
  *
  * `close()` stops receiving, then waits up to `shutdownGraceMs` for the
  * running deliveries. A message whose delivery has not started yet (one
- * waiting for its run included) is made visible again at once. One still running at the deadline is abandoned:
- * its heartbeat stops, nothing is acknowledged, and SQS delivers it again
- * once its visibility timeout runs out.
+ * waiting for its run included) is made visible again at once. One still
+ * running at the deadline is abandoned: its heartbeat stops, nothing is
+ * acknowledged, and SQS delivers it again once its visibility timeout runs
+ * out.
  */
 import {
   ChangeMessageVisibilityCommand,

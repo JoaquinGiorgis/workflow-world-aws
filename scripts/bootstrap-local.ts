@@ -124,7 +124,14 @@ export async function bootstrapLocal(
   }
 }
 
-/** How long the bootstrap waits for a new GSI to become ACTIVE. */
+/**
+ * How long the bootstrap waits for a new GSI to become ACTIVE. On a table
+ * that already holds many items the backfill can take longer; the script
+ * then fails after `UpdateTable` was accepted, and running it again is the
+ * way on: it finds the index (CREATING or ACTIVE), waits for it again and
+ * backfills. It only runs against an emulator, so in practice this is
+ * about large local tables.
+ */
 const INDEX_WAIT_MS = 5 * 60_000;
 
 /**
