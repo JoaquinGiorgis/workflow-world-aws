@@ -178,7 +178,7 @@ export class Consumer {
   private readonly loops: Promise<void>[] = [];
   private readonly running = new Set<Promise<void>>();
   private readonly slots: Slots[] = [];
-  private readonly heartbeats = new Set<() => void>();
+  private readonly heartbeats = new Set<() => Promise<void>>();
   private stopping = false;
   /** Past the grace period: no more SQS calls for running deliveries. */
   private abandoned = false;
@@ -215,7 +215,7 @@ export class Consumer {
       clearTimeout(timer);
       this.abandoned = true;
       this.abandon.abort();
-      for (const stop of this.heartbeats) stop();
+      for (const stop of this.heartbeats) void stop();
       this.heartbeats.clear();
       if (outcome === 'deadline' && this.running.size > 0) {
         this.log(
@@ -327,6 +327,9 @@ export class Consumer {
       return;
     }
 
+    // Every final SQS call of the delivery (delete, backoff, give back)
+    // goes after `stopHeartbeat()`, which waits for a beat in flight: a beat
+    // landing after it would reset the visibility it set.
     const stopHeartbeat = this.heartbeat(queueUrl, receipt);
     const gateKey = runGateKey(message);
     const release = gateKey
@@ -335,6 +338,7 @@ export class Consumer {
     try {
       if (this.stopping) {
         // Received but not started: give it back at once.
+        await stopHeartbeat();
         await this.changeVisibility(queueUrl, receipt, 0);
         return;
       }
@@ -356,6 +360,7 @@ export class Consumer {
 
       switch (result.type) {
         case 'completed':
+          await stopHeartbeat();
           await this.acknowledge(queueUrl, receipt);
           return;
         case 'reschedule':
@@ -365,6 +370,7 @@ export class Consumer {
             followUp(message, attempt, deliveryCount, result.timeoutSeconds),
             result.timeoutSeconds
           );
+          await stopHeartbeat();
           await this.acknowledge(queueUrl, receipt);
           return;
         case 'error':
@@ -375,30 +381,49 @@ export class Consumer {
             status: result.status,
             error: result.text.slice(0, 1_000),
           });
+          await stopHeartbeat();
           await this.retryLater(queueUrl, receipt, receiveCount);
           return;
       }
     } finally {
-      stopHeartbeat();
+      void stopHeartbeat();
       release?.();
     }
   }
 
-  /** Renews the message's visibility until the returned stop is called. */
-  private heartbeat(queueUrl: string, receipt: string): () => void {
+  /**
+   * Renews the message's visibility, one beat at a time, until the returned
+   * stop is called. The stop resolves once the beat in flight, if any, has
+   * settled. Idempotent.
+   */
+  private heartbeat(queueUrl: string, receipt: string): () => Promise<void> {
     const { visibilityTimeoutSeconds, heartbeatIntervalMs } = this.options;
     const interval =
       heartbeatIntervalMs ??
       Math.max(250, (visibilityTimeoutSeconds * 1000) / 3);
-    const timer = setInterval(() => {
-      this.changeVisibility(queueUrl, receipt, visibilityTimeoutSeconds).catch(
-        () => {}
-      );
-    }, interval);
-    const stop = () => {
-      clearInterval(timer);
-      this.heartbeats.delete(stop);
+    let stopped = false;
+    let inFlight: Promise<void> = Promise.resolve();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      timer = setTimeout(() => {
+        inFlight = this.changeVisibility(
+          queueUrl,
+          receipt,
+          visibilityTimeoutSeconds
+        )
+          .catch(() => {})
+          .finally(() => {
+            if (!stopped) schedule();
+          });
+      }, interval);
     };
+    const stop = () => {
+      stopped = true;
+      clearTimeout(timer);
+      this.heartbeats.delete(stop);
+      return inFlight;
+    };
+    schedule();
     this.heartbeats.add(stop);
     return stop;
   }
