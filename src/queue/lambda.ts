@@ -22,7 +22,8 @@
  * - Failed: the record is reported, after `ChangeMessageVisibility` sets
  *   the same backoff the worker uses (`e^receiveCount` seconds, at most an
  *   hour). Without it the message would come back after the queue's
- *   visibility timeout.
+ *   visibility timeout. A record whose handling throws is backed off and
+ *   reported the same way.
  *
  * A spec 9 run's orchestrator records wait for each other within the
  * process (the same `RunGate` the worker uses), and at most `concurrency`
@@ -134,7 +135,13 @@ export async function handleSqsEvent(
           messageId: record.messageId,
           error: describe(error),
         });
-        ok = false;
+        // The same backoff as a failed delivery, rather than the queue's
+        // visibility timeout.
+        const queueUrl = queueUrlOfArn(
+          record.eventSourceARN,
+          options.queueUrls
+        );
+        ok = queueUrl ? await backOff(options, record, queueUrl) : false;
       }
       if (!ok) failed.push(record.messageId);
     }
@@ -149,6 +156,36 @@ export async function handleSqsEvent(
   const order = new Map(records.map((record, i) => [record.messageId, i]));
   failed.sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
   return { batchItemFailures: failed.map((id) => ({ itemIdentifier: id })) };
+}
+
+/**
+ * Sets the record's visibility to the worker's backoff for its receive
+ * count; answers false, the record failed.
+ */
+async function backOff(
+  options: LambdaDeliveryOptions,
+  record: SqsLambdaRecord,
+  queueUrl: string
+): Promise<false> {
+  const delay = (options.retryDelaySeconds ?? defaultRetryDelaySeconds)(
+    receiveCountOf(record.attributes)
+  );
+  try {
+    await options.sqs.send(
+      new ChangeMessageVisibilityCommand({
+        QueueUrl: queueUrl,
+        ReceiptHandle: record.receiptHandle,
+        VisibilityTimeout: Math.max(0, Math.min(43_200, Math.ceil(delay))),
+      })
+    );
+  } catch (error) {
+    // It comes back after the queue's visibility timeout instead.
+    options.log('ChangeMessageVisibility failed', {
+      queueUrl,
+      error: describe(error),
+    });
+  }
+  return false;
 }
 
 /** Whether the record succeeded (Lambda deletes it) or failed. */
@@ -166,27 +203,7 @@ async function handleRecord(
     return false;
   }
   const receiveCount = receiveCountOf(record.attributes);
-  const backOff = async () => {
-    const delay = (options.retryDelaySeconds ?? defaultRetryDelaySeconds)(
-      receiveCount
-    );
-    try {
-      await sqs.send(
-        new ChangeMessageVisibilityCommand({
-          QueueUrl: queueUrl,
-          ReceiptHandle: record.receiptHandle,
-          VisibilityTimeout: Math.max(0, Math.min(43_200, Math.ceil(delay))),
-        })
-      );
-    } catch (error) {
-      // It comes back after the queue's visibility timeout instead.
-      options.log('ChangeMessageVisibility failed', {
-        queueUrl,
-        error: describe(error),
-      });
-    }
-    return false;
-  };
+  const retry = () => backOff(options, record, queueUrl);
 
   let message: QueueMessage;
   let bodyRef: S3Ref | undefined;
@@ -198,7 +215,7 @@ async function handleRecord(
       messageId: record.messageId,
       error: describe(error),
     });
-    return backOff();
+    return retry();
   }
   /** The record succeeded: its S3 body, if any, is not needed any more. */
   const succeed = async () => {
@@ -223,7 +240,7 @@ async function handleRecord(
         messageId: message.messageId,
         error: describe(error),
       });
-      return backOff();
+      return retry();
     }
     return succeed();
   }
@@ -268,7 +285,7 @@ async function handleRecord(
             messageId: message.messageId,
             error: describe(error),
           });
-          return backOff();
+          return retry();
         }
         return succeed();
       default:
@@ -279,7 +296,7 @@ async function handleRecord(
           status: result.status,
           error: result.text.slice(0, 1_000),
         });
-        return backOff();
+        return retry();
     }
   } finally {
     release?.();
