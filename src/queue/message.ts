@@ -10,9 +10,20 @@
  * counting across them.
  */
 import type { MessageId, ValidQueueName } from '@workflow/world';
+import { PayloadTooLargeError } from '../storage/errors.js';
+import { isS3Ref, type PayloadStore, type S3Ref } from '../storage/payloads.js';
+import { nextUlid } from './state.js';
 import { deserializePayload, serializePayload } from './transport.js';
 
 export const MESSAGE_FORMAT_VERSION = 1;
+
+/**
+ * The largest body the World sends in one SQS message: 256 KiB, the size
+ * every queue accepts (`MaximumMessageSize` goes up to 1 MiB, but many
+ * queues keep 256 KiB). A larger message travels in S3: see
+ * {@link encodeForQueue}.
+ */
+export const MAX_SQS_MESSAGE_BYTES = 256 * 1024;
 
 export interface QueueMessage {
   v: typeof MESSAGE_FORMAT_VERSION;
@@ -37,10 +48,88 @@ export interface QueueMessage {
   attemptOffset?: number;
   /** Deliveries made by earlier SQS messages of this message. */
   deliveryOffset?: number;
+  /**
+   * Set on a message too large for SQS: the SQS body only carries the ids
+   * and this reference, and the whole message (this format) is the S3
+   * object. `payload` is then null.
+   */
+  bodyRef?: S3Ref;
 }
 
 export function encodeMessage(message: QueueMessage): string {
   return serializePayload(message);
+}
+
+const encoder = new TextEncoder();
+
+/**
+ * The SQS body of `message`. One over {@link MAX_SQS_MESSAGE_BYTES} is
+ * written whole to S3, under `queue/<runId>/<messageId>/`, and the body
+ * points at it (`bodyRef`). Each send writes its own object; the worker
+ * deletes it with the SQS message that carried it.
+ *
+ * @throws {PayloadTooLargeError} when the message does not fit and no
+ *   bucket is configured.
+ */
+export async function encodeForQueue(
+  message: QueueMessage,
+  payloads: PayloadStore | undefined,
+  maxBytes = MAX_SQS_MESSAGE_BYTES
+): Promise<string> {
+  const body = encodeMessage(message);
+  const bytes = Buffer.byteLength(body);
+  if (bytes <= maxBytes) return body;
+  if (!payloads?.enabled) {
+    throw new PayloadTooLargeError(
+      `The queue message ${message.messageId}`,
+      bytes,
+      {
+        limit: maxBytes,
+        where: 'the AWS World sends in one SQS message',
+      }
+    );
+  }
+  const runId = (message.payload as { runId?: unknown } | null)?.runId;
+  const ref = await payloads.put(
+    [
+      'queue',
+      encodeURIComponent(typeof runId === 'string' ? runId : '_'),
+      message.messageId,
+      nextUlid(),
+    ].join('/'),
+    encoder.encode(body)
+  );
+  return encodeMessage({
+    v: message.v,
+    messageId: message.messageId,
+    queueName: message.queueName,
+    createdAt: message.createdAt,
+    payload: null,
+    bodyRef: ref,
+  });
+}
+
+/**
+ * The whole message behind a body that points to S3, or `message` itself.
+ *
+ * @throws when the object cannot be read or is not a World message.
+ */
+export async function resolveMessage(
+  message: QueueMessage,
+  payloads: PayloadStore | undefined
+): Promise<QueueMessage> {
+  if (message.bodyRef === undefined) return message;
+  if (!isS3Ref(message.bodyRef) || !payloads) {
+    throw new TypeError(
+      'The SQS message points to S3, but no S3 client is set'
+    );
+  }
+  const bytes = await payloads.get(message.bodyRef);
+  const whole = decodeMessage(new TextDecoder().decode(bytes as Uint8Array));
+  if (whole.messageId !== message.messageId) {
+    throw new TypeError('The S3 body belongs to another message');
+  }
+  return whole;
 }
 
 /** @throws {TypeError} when `body` is not a message this World sent. */

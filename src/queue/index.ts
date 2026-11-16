@@ -34,6 +34,8 @@ import {
   createNodeHttpAgents,
   destroyNodeHttpAgents,
 } from '@workflow/world/node-http.js';
+import { PayloadTooLargeError } from '../storage/errors.js';
+import type { PayloadStore } from '../storage/payloads.js';
 import {
   Consumer,
   type ConsumerOptions,
@@ -44,7 +46,7 @@ import { deliver } from './delivery.js';
 import { createQueueHandler } from './handler.js';
 import { IdempotencyStore } from './idempotency.js';
 import {
-  encodeMessage,
+  encodeForQueue,
   MESSAGE_FORMAT_VERSION,
   type QueueMessage,
 } from './message.js';
@@ -61,7 +63,11 @@ export const DEPLOYMENT_ID = 'aws';
  */
 export const DEFAULT_MAX_RECEIVE_COUNT = 73;
 
-/** SQS's request size limit, which a batch must fit in. */
+/**
+ * The most body bytes one SendMessageBatch carries: the size every queue
+ * accepts for one message (`MAX_SQS_MESSAGE_BYTES`). SQS takes up to 1 MiB
+ * per batch request, so this is conservative.
+ */
 const MAX_BATCH_BYTES = 256 * 1024;
 const MAX_BATCH_ENTRIES = 10;
 
@@ -78,6 +84,11 @@ export interface SqsQueueOptions {
   visibilityTimeoutSeconds: number;
   pollWaitSeconds: number;
   shutdownGraceMs: number;
+  /**
+   * Where messages too large for SQS travel (S3). Without a bucket such a
+   * send fails with `PayloadTooLargeError`.
+   */
+  payloads?: PayloadStore;
   /** @internal Test hooks. */
   internal?: Pick<
     ConsumerOptions,
@@ -179,7 +190,8 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
         sqs,
         queueUrlFor(payload),
         message,
-        opts?.delaySeconds
+        opts?.delaySeconds,
+        options.payloads
       );
     } catch (error) {
       if (reserved) {
@@ -244,7 +256,20 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
             notBefore: schedule.notBefore,
           }),
         };
-        const body = encodeMessage(message);
+        let body: string;
+        try {
+          body = await encodeForQueue(message, options.payloads);
+        } catch (error) {
+          results[index] = {
+            messageId: null,
+            error: describe(error),
+            retryable: !(error instanceof PayloadTooLargeError),
+          };
+          if (reserved) {
+            await idempotency.release(reserved.key, messageId, reserved.at);
+          }
+          return;
+        }
         const url = queueUrlFor(payload);
         const pending = byQueue.get(url) ?? [];
         pending.push({
@@ -353,6 +378,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
       pollWaitSeconds: options.pollWaitSeconds,
       shutdownGraceMs: options.shutdownGraceMs,
       runGate: shared.runGate,
+      ...(options.payloads && { payloads: options.payloads }),
       deliver: (delivery) =>
         deliver(
           {

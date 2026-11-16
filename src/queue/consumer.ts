@@ -50,9 +50,15 @@ import {
   singleOrchestratorRunIdOf,
   type ValidQueueName,
 } from '@workflow/world';
+import type { PayloadStore, S3Ref } from '../storage/payloads.js';
 import { sleep } from '../storage/table.js';
 import type { Delivery, DeliveryResult } from './delivery.js';
-import { decodeMessage, encodeMessage, type QueueMessage } from './message.js';
+import {
+  decodeMessage,
+  encodeForQueue,
+  type QueueMessage,
+  resolveMessage,
+} from './message.js';
 import type { RunGate } from './state.js';
 
 /** SQS's largest per-message delay. */
@@ -101,24 +107,32 @@ export function scheduleOf(
   };
 }
 
-/** Sends `message` to `queueUrl` after `delaySeconds`, however long. */
+/**
+ * Sends `message` to `queueUrl` after `delaySeconds`, however long. A
+ * message too large for SQS travels in S3 (`encodeForQueue`).
+ */
 export async function sendQueueMessage(
   sqs: SQSClient,
   queueUrl: string,
   message: QueueMessage,
-  delaySeconds: number | undefined
+  delaySeconds: number | undefined,
+  payloads?: PayloadStore
 ): Promise<void> {
-  const { notBefore: _previous, ...rest } = message;
+  const { notBefore: _previous, bodyRef: _ref, ...rest } = message;
   const schedule = scheduleOf(delaySeconds);
+  const body = await encodeForQueue(
+    {
+      ...rest,
+      ...(schedule.notBefore !== undefined && {
+        notBefore: schedule.notBefore,
+      }),
+    },
+    payloads
+  );
   await sqs.send(
     new SendMessageCommand({
       QueueUrl: queueUrl,
-      MessageBody: encodeMessage({
-        ...rest,
-        ...(schedule.notBefore !== undefined && {
-          notBefore: schedule.notBefore,
-        }),
-      }),
+      MessageBody: body,
       ...(schedule.delaySeconds > 0 && { DelaySeconds: schedule.delaySeconds }),
     })
   );
@@ -137,6 +151,8 @@ export interface ConsumerOptions {
   retryDelaySeconds?: (receiveCount: number) => number;
   /** How often a running delivery renews its visibility. */
   heartbeatIntervalMs?: number;
+  /** Reads (and deletes) the bodies of messages too large for SQS. */
+  payloads?: PayloadStore;
   log?: (message: string, detail?: Record<string, unknown>) => void;
 }
 
@@ -297,13 +313,18 @@ export class Consumer {
       Number(received.Attributes?.ApproximateReceiveCount ?? 1) || 1
     );
     const receipt = received.ReceiptHandle ?? '';
+    const { payloads } = this.options;
     let message: QueueMessage;
+    /** The S3 body of this SQS message, deleted with it. */
+    let bodyRef: S3Ref | undefined;
     try {
       message = decodeMessage(received.Body);
+      bodyRef = message.bodyRef;
+      message = await resolveMessage(message, payloads);
       parseQueueName(message.queueName as ValidQueueName);
     } catch (error) {
-      // Not something this World sent: back off, and let the redrive policy
-      // move it to the dead-letter queue.
+      // Not something this World sent (or its S3 body is gone): back off,
+      // and let the redrive policy move it to the dead-letter queue.
       this.log('Received a message that is not a World message', {
         queueUrl,
         messageId: received.MessageId,
@@ -321,9 +342,10 @@ export class Consumer {
         this.options.sqs,
         queueUrl,
         message,
-        (message.notBefore - Date.now()) / 1000
+        (message.notBefore - Date.now()) / 1000,
+        payloads
       );
-      await this.acknowledge(queueUrl, receipt);
+      await this.acknowledge(queueUrl, receipt, bodyRef);
       return;
     }
 
@@ -361,17 +383,18 @@ export class Consumer {
       switch (result.type) {
         case 'completed':
           await stopHeartbeat();
-          await this.acknowledge(queueUrl, receipt);
+          await this.acknowledge(queueUrl, receipt, bodyRef);
           return;
         case 'reschedule':
           await sendQueueMessage(
             this.options.sqs,
             queueUrl,
             followUp(message, attempt, deliveryCount, result.timeoutSeconds),
-            result.timeoutSeconds
+            result.timeoutSeconds,
+            payloads
           );
           await stopHeartbeat();
-          await this.acknowledge(queueUrl, receipt);
+          await this.acknowledge(queueUrl, receipt, bodyRef);
           return;
         case 'error':
           this.log('Queue delivery failed; retrying after a backoff', {
@@ -462,7 +485,16 @@ export class Consumer {
     }
   }
 
-  private async acknowledge(queueUrl: string, receipt: string): Promise<void> {
+  /**
+   * Deletes the message, and then the S3 object holding its body, if any:
+   * no copy of the message needs it any more (a message sent on gets its
+   * own). A message that is not deleted keeps its object.
+   */
+  private async acknowledge(
+    queueUrl: string,
+    receipt: string,
+    bodyRef?: S3Ref
+  ): Promise<void> {
     try {
       await this.options.sqs.send(
         new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: receipt })
@@ -471,6 +503,17 @@ export class Consumer {
       // Delivered again later: the queue is at-least-once.
       this.log('DeleteMessage failed; the message will be delivered again', {
         queueUrl,
+        error: describe(error),
+      });
+      return;
+    }
+    if (!bodyRef || !this.options.payloads) return;
+    try {
+      await this.options.payloads.delete(bodyRef);
+    } catch (error) {
+      // Only storage is left behind; see the README on bucket lifecycle.
+      this.log('Could not delete the S3 body of a deleted message', {
+        ref: bodyRef.s3Ref,
         error: describe(error),
       });
     }
