@@ -1,7 +1,17 @@
-import { TransactionCanceledException } from '@aws-sdk/client-dynamodb';
-import { ReceiveMessageCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
 import {
+  ConditionalCheckFailedException,
+  TransactionCanceledException,
+} from '@aws-sdk/client-dynamodb';
+import {
+  ChangeMessageVisibilityCommand,
+  DeleteMessageCommand,
+  ReceiveMessageCommand,
+  SendMessageCommand,
+} from '@aws-sdk/client-sqs';
+import {
+  DeleteCommand,
   GetCommand,
+  PutCommand,
   QueryCommand,
   TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
@@ -11,6 +21,7 @@ import {
 } from '@workflow/world';
 import { mockClient } from 'aws-sdk-client-mock';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { sqsMessage } from '../test/unit/sqs-mock.js';
 import {
   AwsWorldConfigError,
   createClients,
@@ -292,6 +303,188 @@ describe('createWorld', () => {
         destroyClients(clients);
       }
     });
+  });
+
+  describe('recovery across processes', () => {
+    const conditionFailed = () =>
+      new ConditionalCheckFailedException({
+        message: 'The conditional request failed',
+        $metadata: {},
+      });
+
+    function setUp(name: string, extra: Record<string, unknown> = {}) {
+      const clients = createClients(options);
+      const ddb = mockClient(clients.documents);
+      const sqs = mockClient(clients.sqs);
+      ddb.on(QueryCommand).resolves({ Items: [] });
+      ddb.on(PutCommand).resolves({});
+      ddb.on(DeleteCommand).resolves({});
+      sqs.on(SendMessageCommand).resolves({});
+      sqs.on(ReceiveMessageCommand).callsFake(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return {};
+      });
+      const world = createWorld({
+        ...options,
+        workflowQueueUrl: `${options.workflowQueueUrl}-${name}`,
+        clients,
+        pollWaitSeconds: 0,
+        ...extra,
+      });
+      const recoveries = () =>
+        ddb
+          .commandCalls(QueryCommand)
+          .filter((call) => call.args[0].input.IndexName === 'GSI3').length;
+      const guards = () =>
+        ddb
+          .commandCalls(PutCommand)
+          .map((call) => call.args[0].input)
+          .filter((input) => input.Item?.PK === 'RECOVERY');
+      const done = async () => {
+        await world.close();
+        ddb.restore();
+        sqs.restore();
+        destroyClients(clients);
+      };
+      return { world, ddb, sqs, recoveries, guards, done };
+    }
+
+    it('records each recovery on the table, for 15 minutes by default', async () => {
+      const { world, recoveries, guards, done } = setUp('guard');
+      try {
+        const before = Date.now();
+        await world.start();
+        expect(recoveries()).toBe(1);
+        const [guard] = guards();
+        expect(guard).toMatchObject({
+          TableName: 'workflow',
+          Item: { PK: 'RECOVERY', SK: 'LAST', type: 'recovery' },
+          ConditionExpression:
+            'attribute_not_exists(PK) OR recoveredAt < :cutoff',
+        });
+        const recoveredAt = Number(guard?.Item?.recoveredAt);
+        expect(recoveredAt).toBeGreaterThanOrEqual(before);
+        expect(
+          guard?.ExpressionAttributeValues?.[':cutoff']
+        ).toBe(recoveredAt - 900_000);
+        expect(Number(guard?.Item?.expiresAt)).toBeGreaterThan(
+          recoveredAt / 1000 + 900
+        );
+      } finally {
+        await done();
+      }
+    });
+
+    it('skips recovery when another process recovered the table recently', async () => {
+      const { world, ddb, sqs, recoveries, done } = setUp('guarded');
+      ddb.on(PutCommand).rejects(conditionFailed());
+      try {
+        await world.start();
+        expect(recoveries()).toBe(0);
+        // The worker starts all the same.
+        await vi.waitFor(() =>
+          expect(
+            sqs.commandCalls(ReceiveMessageCommand).length
+          ).toBeGreaterThan(0)
+        );
+      } finally {
+        await done();
+      }
+    });
+
+    it('gives the record back when recovery fails', async () => {
+      const { world, ddb, done } = setUp('guard-failed');
+      ddb.on(QueryCommand).rejects(new Error('throttled'));
+      try {
+        await expect(world.start()).rejects.toThrow('throttled');
+        const put = ddb
+          .commandCalls(PutCommand)
+          .map((call) => call.args[0].input)
+          .find((input) => input.Item?.PK === 'RECOVERY');
+        const release = ddb.commandCalls(DeleteCommand)[0]?.args[0].input;
+        expect(release).toMatchObject({
+          Key: { PK: 'RECOVERY', SK: 'LAST' },
+          ConditionExpression: 'recoveredAt = :mine',
+          ExpressionAttributeValues: { ':mine': put?.Item?.recoveredAt },
+        });
+      } finally {
+        await done();
+      }
+    });
+
+    it('recovers on every start with recoveryIntervalSeconds: 0', async () => {
+      const { world, recoveries, guards, done } = setUp('unguarded', {
+        recoveryIntervalSeconds: 0,
+      });
+      try {
+        await world.start();
+        expect(recoveries()).toBe(1);
+        expect(guards()).toEqual([]);
+      } finally {
+        await done();
+      }
+    });
+  });
+
+  it('keeps streams readable for the deliveries close() waits for', async () => {
+    const clients = createClients(options);
+    const ddb = mockClient(clients.documents);
+    const sqs = mockClient(clients.sqs);
+    ddb.on(QueryCommand).callsFake(async (input: { IndexName?: string }) =>
+      input.IndexName
+        ? { Items: [] }
+        : { Items: [{ PK: 'STREAM#wrun_x#s', SK: 'CLOSED', count: 0 }] }
+    );
+    ddb.on(GetCommand).resolves({});
+    ddb.on(PutCommand).resolves({});
+    sqs.on(SendMessageCommand).resolves({});
+    sqs.on(DeleteMessageCommand).resolves({});
+    sqs.on(ChangeMessageVisibilityCommand).resolves({});
+    let served = false;
+    sqs.on(ReceiveMessageCommand).callsFake(async () => {
+      if (!served) {
+        served = true;
+        return { Messages: [sqsMessage({ payload: { runId: 'wrun_x' } })] };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return {};
+    });
+    const world = createWorld({
+      ...options,
+      workflowQueueUrl: `${options.workflowQueueUrl}-close-order`,
+      clients,
+      pollWaitSeconds: 0,
+      streamPollIntervalMs: 10,
+    });
+    let started = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let read: unknown;
+    world.registerHandler(
+      '__wkf_workflow_',
+      world.createQueueHandler('__wkf_workflow_', async () => {
+        started = true;
+        await gate;
+        // The run's stream, read by a delivery close() is waiting for.
+        const reader = (await world.streams.get('wrun_x', 's')).getReader();
+        read = await reader.read();
+      })
+    );
+    try {
+      await world.start();
+      await vi.waitFor(() => expect(started).toBe(true));
+      const closing = world.close();
+      release();
+      await closing;
+      expect(read).toEqual({ done: true, value: undefined });
+    } finally {
+      await world.close();
+      ddb.restore();
+      sqs.restore();
+      destroyClients(clients);
+    }
   });
 
   it('closes once', async () => {

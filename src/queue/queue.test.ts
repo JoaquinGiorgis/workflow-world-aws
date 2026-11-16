@@ -201,11 +201,39 @@ describe('queue() with an idempotency key', () => {
       { idempotencyKey: 'overtaken' }
     );
     expect(sent(mocks)).toHaveLength(1);
+    // The confirmation runs after queue() answered; close() waits for it.
+    await queue.close();
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining('overtaken'),
       expect.objectContaining({ idempotencyKey: 'overtaken', messageId })
     );
-    await queue.close();
+  });
+
+  it('answers before the key is marked sent, and close() waits for that', async () => {
+    let confirmed!: () => void;
+    mocks.ddbMock.on(UpdateCommand).callsFake(
+      () =>
+        new Promise((resolve) => {
+          confirmed = () => resolve({});
+        })
+    );
+    const queue = createSqsQueue(queueOptions(mocks));
+    const { messageId } = await queue.queue(
+      queueName,
+      { runId: 'wrun_A', stepId: 'step_1' } as never,
+      { idempotencyKey: 'fast' }
+    );
+    expect(messageId).toMatch(/^msg_/);
+    expect(mocks.ddbMock.commandCalls(UpdateCommand)).toHaveLength(1);
+    let closed = false;
+    const closing = queue.close().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(closed).toBe(false);
+    confirmed();
+    await closing;
+    expect(closed).toBe(true);
   });
 
   it('answers the stored message id and sends nothing when the key was used', async () => {

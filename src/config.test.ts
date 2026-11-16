@@ -121,6 +121,7 @@ describe('resolveConfig', () => {
     ['visibilityTimeoutSeconds', 43_201],
     ['shutdownGraceMs', -1],
     ['streamPollIntervalMs', 0],
+    ['recoveryIntervalSeconds', -1],
   ] as const)('rejects %s=%d', (key, value) => {
     const problems = problemsOf(() =>
       resolveConfig(validEnv, { [key]: value })
@@ -137,6 +138,7 @@ describe('resolveConfig', () => {
       WORKFLOW_AWS_SHUTDOWN_GRACE_MS: '0',
       WORKFLOW_AWS_POLL_WAIT_SECONDS: '1',
       WORKFLOW_AWS_STREAM_POLL_INTERVAL_MS: ' 100 ',
+      WORKFLOW_AWS_RECOVERY_INTERVAL_SECONDS: '0',
     });
     expect(config).toMatchObject({
       concurrency: 4,
@@ -144,7 +146,12 @@ describe('resolveConfig', () => {
       shutdownGraceMs: 0,
       pollWaitSeconds: 1,
       streamPollIntervalMs: 100,
+      recoveryIntervalSeconds: 0,
     });
+  });
+
+  it('recovers a table at most every 15 minutes by default', () => {
+    expect(resolveConfig(validEnv).recoveryIntervalSeconds).toBe(900);
   });
 
   it('prefers an explicit numeric option over its variable', () => {
