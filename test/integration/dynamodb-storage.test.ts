@@ -132,8 +132,10 @@ describe('DynamoDB storage', () => {
 
   it('refuses a payload over the item limit with a typed error, writing nothing', async () => {
     const runId = await runningRun();
+    // Without a bucket: with one, the payload goes to S3 (s3-payloads.test.ts).
+    const noBucket = context.secondWorld({ bucket: undefined });
     await expect(
-      world.events.create(runId, {
+      noBucket.events.create(runId, {
         eventType: 'step_created',
         correlationId: 'step_big',
         eventData: { stepName: 's', input: new Uint8Array(360 * 1024) },
@@ -151,6 +153,7 @@ describe('DynamoDB storage', () => {
     await expect(world.steps.get(runId, 'step_big')).rejects.toThrow(
       'Step not found'
     );
+    await noBucket.close?.();
   });
 
   it('pages runs of one workflow with opaque cursors, through GSI2', async () => {

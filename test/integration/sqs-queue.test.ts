@@ -7,6 +7,12 @@
  */
 import { randomUUID } from 'node:crypto';
 import {
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  NotFound,
+} from '@aws-sdk/client-s3';
+import {
+  ChangeMessageVisibilityCommand,
   type Message,
   ReceiveMessageCommand,
   SendMessageCommand,
@@ -34,7 +40,8 @@ import {
 } from '../../src/clients.js';
 import { createWorld } from '../../src/index.js';
 import { createSqsQueue, type SqsQueueOptions } from '../../src/queue/index.js';
-import { encodeMessage } from '../../src/queue/message.js';
+import { decodeMessage, encodeMessage } from '../../src/queue/message.js';
+import { PayloadStore, parseRef } from '../../src/storage/payloads.js';
 
 const aws = inject('aws');
 const prefix = '__wkf_workflow_';
@@ -374,6 +381,103 @@ describe('the SQS queue', () => {
     expect(await next.startWorker()).toBe(true);
     await vi.waitFor(() => expect(seen).toHaveLength(2), { timeout: 15_000 });
     expect(seen[1]).toMatchObject({ messageId, deliveryCount: 2 });
+  });
+});
+
+describe('messages too large for SQS', () => {
+  const large = () =>
+    payload({
+      runInput: {
+        input: new Uint8Array(400 * 1024).map((_, i) => i % 251),
+        deploymentId: 'aws',
+        workflowName: 'wf',
+        specVersion: 8,
+      },
+    });
+  const payloads = () =>
+    new PayloadStore({ s3: clients.s3, bucket: aws.bucket });
+
+  async function exists(ref: string): Promise<boolean> {
+    const { bucket, key } = parseRef(ref);
+    try {
+      await clients.s3.send(
+        new HeadObjectCommand({ Bucket: bucket, Key: key })
+      );
+      return true;
+    } catch (error) {
+      if (error instanceof NotFound) return false;
+      throw error;
+    }
+  }
+
+  it('travel through S3 and are delivered whole, then their object is deleted', async () => {
+    const seen: [unknown, Meta][] = [];
+    const { queue, options } = await setUp(
+      async (message, meta) => {
+        seen.push([message, meta]);
+      },
+      { payloads: payloads() }
+    );
+    const sent = large();
+    const { messageId } = await queue.queue(queueName, sent);
+
+    // In SQS: a small body pointing at the object.
+    const [inQueue] = await receiveAll(options.workflowQueueUrl);
+    const pointer = decodeMessage(inQueue?.Body);
+    expect(pointer).toMatchObject({ messageId, payload: null });
+    const ref = pointer.bodyRef?.s3Ref ?? '';
+    expect(ref).toMatch(`s3://${aws.bucket}/queue/`);
+    expect(await exists(ref)).toBe(true);
+    // Make it visible again for the worker.
+    await clients.sqs.send(
+      new ChangeMessageVisibilityCommand({
+        QueueUrl: options.workflowQueueUrl,
+        ReceiptHandle: inQueue?.ReceiptHandle,
+        VisibilityTimeout: 0,
+      })
+    );
+
+    await queue.startWorker();
+    await vi.waitFor(() => expect(seen).toHaveLength(1), { timeout: 15_000 });
+    expect(seen[0]?.[0]).toEqual(sent);
+    expect(seen[0]?.[1]).toMatchObject({ messageId, queueName });
+    await vi.waitFor(async () => expect(await exists(ref)).toBe(false), {
+      timeout: 10_000,
+    });
+    await queue.close();
+    expect(await receiveAll(options.workflowQueueUrl)).toEqual([]);
+  });
+
+  it('keep their id across a { timeoutSeconds } redelivery, each copy with its own object', async () => {
+    const seen: Meta[] = [];
+    const { queue } = await setUp(
+      async (_message, meta) => {
+        seen.push(meta);
+        return seen.length === 1 ? { timeoutSeconds: 1 } : undefined;
+      },
+      { payloads: payloads() }
+    );
+    await queue.startWorker();
+    const { messageId } = await queue.queue(queueName, large());
+
+    await vi.waitFor(() => expect(seen).toHaveLength(2), { timeout: 20_000 });
+    expect(seen.map((meta) => [meta.messageId, meta.deliveryCount])).toEqual([
+      [messageId, 1],
+      [messageId, 2],
+    ]);
+    await queue.close();
+    // Both copies' objects are gone with their messages.
+    const left = await clients.s3.send(
+      new ListObjectsV2Command({
+        Bucket: aws.bucket,
+        Prefix: 'queue/',
+      })
+    );
+    expect(
+      (left.Contents ?? []).filter((object) =>
+        object.Key?.includes(`/${messageId}/`)
+      )
+    ).toEqual([]);
   });
 });
 
