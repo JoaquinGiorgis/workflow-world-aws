@@ -73,7 +73,7 @@ afterEach(() => {
 });
 
 describe('bootstrapLocal', () => {
-  it('creates the table with both GSIs, on demand', async () => {
+  it('creates the table with its three GSIs, on demand', async () => {
     await bootstrapLocal({ ...base, clients });
 
     const [create] = dynamodb.commandCalls(CreateTableCommand);
@@ -87,10 +87,15 @@ describe('bootstrapLocal', () => {
     expect(input?.GlobalSecondaryIndexes?.map((gsi) => gsi.IndexName)).toEqual([
       'GSI1',
       'GSI2',
+      'GSI3',
     ]);
     expect(input?.GlobalSecondaryIndexes?.[0]?.KeySchema).toEqual([
       { AttributeName: 'GSI1PK', KeyType: 'HASH' },
       { AttributeName: 'GSI1SK', KeyType: 'RANGE' },
+    ]);
+    expect(input?.GlobalSecondaryIndexes?.[2]?.KeySchema).toEqual([
+      { AttributeName: 'GSI3PK', KeyType: 'HASH' },
+      { AttributeName: 'GSI3SK', KeyType: 'RANGE' },
     ]);
     expect(input?.ProvisionedThroughput).toBeUndefined();
   });

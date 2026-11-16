@@ -33,7 +33,7 @@ import {
   createClients,
   destroyClients,
 } from '../src/clients.js';
-import { GSI1_NAME, GSI2_NAME } from '../src/keys.js';
+import { GSI1_NAME, GSI2_NAME, GSI3_NAME } from '../src/keys.js';
 
 /** Attribute the table's TTL reads (epoch seconds). */
 export const TTL_ATTRIBUTE = 'expiresAt';
@@ -101,9 +101,10 @@ export async function bootstrapLocal(
 }
 
 /**
- * Creates the World's table: PK/SK, GSI1 (every run and every hook, by id)
- * and GSI2 (runs per workflow name), on-demand billing, and TTL on
- * {@link TTL_ATTRIBUTE}. Keeps a table that already exists.
+ * Creates the World's table: PK/SK, GSI1 (every run and every hook, by id),
+ * GSI2 (runs per workflow name) and the sparse GSI3 (runs that have not
+ * ended), on-demand billing, and TTL on {@link TTL_ATTRIBUTE}. Keeps a table
+ * that already exists.
  */
 export async function createWorkflowTable(
   clients: AwsClients,
@@ -121,6 +122,8 @@ export async function createWorkflowTable(
           { AttributeName: 'GSI1SK', AttributeType: 'S' },
           { AttributeName: 'GSI2PK', AttributeType: 'S' },
           { AttributeName: 'GSI2SK', AttributeType: 'S' },
+          { AttributeName: 'GSI3PK', AttributeType: 'S' },
+          { AttributeName: 'GSI3SK', AttributeType: 'S' },
         ],
         KeySchema: [
           { AttributeName: 'PK', KeyType: 'HASH' },
@@ -140,6 +143,14 @@ export async function createWorkflowTable(
             KeySchema: [
               { AttributeName: 'GSI2PK', KeyType: 'HASH' },
               { AttributeName: 'GSI2SK', KeyType: 'RANGE' },
+            ],
+            Projection: { ProjectionType: 'ALL' },
+          },
+          {
+            IndexName: GSI3_NAME,
+            KeySchema: [
+              { AttributeName: 'GSI3PK', KeyType: 'HASH' },
+              { AttributeName: 'GSI3SK', KeyType: 'RANGE' },
             ],
             Projection: { ProjectionType: 'ALL' },
           },

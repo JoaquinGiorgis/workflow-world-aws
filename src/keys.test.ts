@@ -127,12 +127,14 @@ describe('entity keys', () => {
 });
 
 describe('GSI keys', () => {
-  it('indexes every run by id, and runs per workflow by id', () => {
+  it('indexes every run by id, runs per workflow by id, and a new run as active', () => {
     expect(runIndexKeys('wrun_A', 'wf//add')).toEqual({
       GSI1PK: 'RUNS',
       GSI1SK: 'wrun_A',
       GSI2PK: 'WF#wf//add',
       GSI2SK: 'wrun_A',
+      GSI3PK: 'ACTIVE',
+      GSI3SK: 'wrun_A',
     });
   });
 

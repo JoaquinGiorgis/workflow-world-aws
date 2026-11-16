@@ -37,6 +37,8 @@ const BOOKKEEPING = new Set([
   'GSI1SK',
   'GSI2PK',
   'GSI2SK',
+  'GSI3PK',
+  'GSI3SK',
   'seq',
   'seqInBand',
   'rev',

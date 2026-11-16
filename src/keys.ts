@@ -24,7 +24,10 @@
  *
  * GSI1 lists every run (`RUNS`) and every hook (`HOOKS`) by id; run ids
  * are ULIDs, so id order is creation order. GSI2 lists the runs of one
- * workflow (`WF#<workflowName>`), also by id.
+ * workflow (`WF#<workflowName>`), also by id. GSI3 is sparse: it lists the
+ * runs that have not ended (`ACTIVE`), by id. A run item carries its GSI3
+ * attributes from its creation until the write that ends the run removes
+ * them, in the same transaction, so recovery reads only active runs.
  */
 
 export interface TableKey {
@@ -63,10 +66,15 @@ export const PREFIX = {
 
 export const GSI1_NAME = 'GSI1';
 export const GSI2_NAME = 'GSI2';
+export const GSI3_NAME = 'GSI3';
 /** GSI1 partition holding every run. */
 export const ALL_RUNS_GSI1PK = 'RUNS';
 /** GSI1 partition holding every hook. */
 export const ALL_HOOKS_GSI1PK = 'HOOKS';
+/** GSI3 partition holding the runs that have not ended. */
+export const ACTIVE_RUNS_GSI3PK = 'ACTIVE';
+/** The attributes that put a run item in GSI3. */
+export const ACTIVE_RUN_INDEX_ATTRIBUTES = ['GSI3PK', 'GSI3SK'] as const;
 
 function requireComponent(value: string, what: string): string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -222,17 +230,36 @@ export function idempotencyKey(key: string): TableKey {
   };
 }
 
-/** Index attributes of a run item: GSI1 (all runs), GSI2 (per workflow). */
+/**
+ * Index attributes of a new run item: GSI1 (all runs), GSI2 (per workflow)
+ * and GSI3 (active runs), which a new run is.
+ */
 export function runIndexKeys(
   runId: string,
   workflowName: string
-): { GSI1PK: string; GSI1SK: string; GSI2PK: string; GSI2SK: string } {
+): {
+  GSI1PK: string;
+  GSI1SK: string;
+  GSI2PK: string;
+  GSI2SK: string;
+  GSI3PK: string;
+  GSI3SK: string;
+} {
   return {
     GSI1PK: ALL_RUNS_GSI1PK,
     GSI1SK: requireRunId(runId),
     GSI2PK: `${PREFIX.runsByWorkflow}${requireComponent(workflowName, 'workflowName')}`,
     GSI2SK: runId,
+    ...activeRunIndexKeys(runId),
   };
+}
+
+/** GSI3 attributes of a run that has not ended. */
+export function activeRunIndexKeys(runId: string): {
+  GSI3PK: string;
+  GSI3SK: string;
+} {
+  return { GSI3PK: ACTIVE_RUNS_GSI3PK, GSI3SK: requireRunId(runId) };
 }
 
 /** Index attributes of a hook item: GSI1 (all hooks). */

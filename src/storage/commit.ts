@@ -23,9 +23,18 @@
  * asked for `ALL_OLD`) are handed to the next decision by tag.
  */
 import { WorkflowWorldError } from '@workflow/errors';
-import { IN_BAND_SEQ_AT_RUN_CREATION, slotToEventId } from '@workflow/world';
+import {
+  IN_BAND_SEQ_AT_RUN_CREATION,
+  isTerminalWorkflowRunStatus,
+  slotToEventId,
+} from '@workflow/world';
 import { monotonicFactory } from 'ulid';
-import { eventKey, runMetaKey } from '../keys.js';
+import {
+  ACTIVE_RUN_INDEX_ATTRIBUTES,
+  activeRunIndexKeys,
+  eventKey,
+  runMetaKey,
+} from '../keys.js';
 import {
   DYNAMODB_ITEM_BYTES,
   MAX_ITEM_BYTES,
@@ -298,6 +307,7 @@ function appendItems(
       throw new PayloadTooLargeError(`The run item of ${runId}`, size);
     }
   }
+  const { set, remove } = withActiveRunIndex(append);
   const names: Record<string, string> = { '#rev': 'rev' };
   const values: Record<string, unknown> = {
     ':rev1': (state.rev ?? 0) + 1,
@@ -311,14 +321,14 @@ function appendItems(
     sets.push('#seq = :seq', '#seqInBand = :seqInBand');
   }
   let n = 0;
-  for (const [name, value] of Object.entries(append.set ?? {})) {
+  for (const [name, value] of Object.entries(set ?? {})) {
     if (value === undefined) continue;
     names[`#a${n}`] = name;
     values[`:a${n}`] = toStorable(value);
     sets.push(`#a${n} = :a${n}`);
     n++;
   }
-  const removes = (append.remove ?? []).map((name) => {
+  const removes = (remove ?? []).map((name) => {
     names[`#a${n}`] = name;
     return `#a${n++}`;
   });
@@ -342,6 +352,35 @@ function appendItems(
     },
   });
   return items;
+}
+
+/**
+ * Keeps the run item in GSI3 (active runs) exactly while the run has not
+ * ended: a write that sets a terminal status removes the run's GSI3
+ * attributes, and one that sets another status (re)sets them, in the same
+ * update.
+ */
+function withActiveRunIndex(append: Append): Pick<Append, 'set' | 'remove'> {
+  const status = append.set?.status;
+  if (typeof status !== 'string') {
+    return { set: append.set, remove: append.remove };
+  }
+  if (isTerminalWorkflowRunStatus(status)) {
+    return {
+      set: append.set,
+      remove: [
+        ...(append.remove ?? []).filter(
+          (name) =>
+            !(ACTIVE_RUN_INDEX_ATTRIBUTES as readonly string[]).includes(name)
+        ),
+        ...ACTIVE_RUN_INDEX_ATTRIBUTES,
+      ],
+    };
+  }
+  return {
+    set: { ...append.set, ...activeRunIndexKeys(append.runId) },
+    remove: append.remove,
+  };
 }
 
 /**

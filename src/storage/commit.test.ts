@@ -267,4 +267,59 @@ describe('the event commit', () => {
     ).rejects.toMatchObject({ name: 'InBandSupersededError', status: 412 });
     expect(transactions()).toHaveLength(0);
   });
+
+  it('takes a run out of the active-runs index in the write that ends it', async () => {
+    serve({ [`RUN#${runId}|META`]: runItem() });
+    ddb.on(TransactWriteCommand).resolves({});
+    const storage = createStorage({ documents, tableName: 'wf' });
+    await storage.events.create(runId, {
+      eventType: 'run_completed',
+      eventData: { output: new Uint8Array([1]) },
+    });
+
+    const update = transactions()[0]?.TransactItems?.[0]?.Update;
+    const names = update?.ExpressionAttributeNames ?? {};
+    const removed = (update?.UpdateExpression ?? '')
+      .split(' REMOVE ')[1]
+      ?.split(', ')
+      .map((name) => names[name]);
+    expect(removed).toEqual(['GSI3PK', 'GSI3SK']);
+  });
+
+  it('keeps a started run in the active-runs index', async () => {
+    serve({ [`RUN#${runId}|META`]: runItem({ status: 'pending' }) });
+    ddb.on(TransactWriteCommand).resolves({});
+    const storage = createStorage({ documents, tableName: 'wf' });
+    await storage.events.create(runId, { eventType: 'run_started' });
+
+    const update = transactions()[0]?.TransactItems?.[0]?.Update;
+    expect(update?.UpdateExpression).not.toContain('REMOVE');
+    expect(Object.values(update?.ExpressionAttributeValues ?? {})).toEqual(
+      expect.arrayContaining(['ACTIVE', runId, 'running'])
+    );
+  });
+
+  it('lists only active runs from the sparse index', async () => {
+    ddb.on(QueryCommand).resolves({ Items: [runItem()] });
+    const storage = createStorage({ documents, tableName: 'wf' });
+    const page = await storage.runs.list({
+      status: ['pending', 'running'],
+      resolveData: 'none',
+    });
+
+    expect(page.data.map((run) => run.runId)).toEqual([runId]);
+    const query = ddb.commandCalls(QueryCommand)[0]?.args[0].input;
+    expect(query?.IndexName).toBe('GSI3');
+    expect(query?.KeyConditionExpression).toBe('GSI3PK = :pk');
+    expect(query?.ExpressionAttributeValues?.[':pk']).toBe('ACTIVE');
+  });
+
+  it('reads all runs for a terminal status', async () => {
+    ddb.on(QueryCommand).resolves({ Items: [] });
+    const storage = createStorage({ documents, tableName: 'wf' });
+    await storage.runs.list({ status: ['completed', 'running'] });
+    expect(ddb.commandCalls(QueryCommand)[0]?.args[0].input.IndexName).toBe(
+      'GSI1'
+    );
+  });
 });

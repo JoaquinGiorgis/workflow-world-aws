@@ -174,6 +174,44 @@ describe('DynamoDB storage', () => {
     expect(seen).toEqual(wanted);
   });
 
+  it('keeps exactly the runs that have not ended in the active-runs index', async () => {
+    const pending = await world.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId: 'dpl', workflowName: 'wf', input: [] },
+    });
+    const running = await runningRun();
+    const completed = await runningRun();
+    await world.events.create(completed, {
+      eventType: 'run_completed',
+      eventData: { output: new Uint8Array([1]) },
+    });
+    const cancelled = await runningRun();
+    await world.events.create(cancelled, { eventType: 'run_cancelled' });
+
+    const active = await world.runs.list({
+      status: ['pending', 'running'],
+      resolveData: 'none',
+      pagination: { sortOrder: 'asc' },
+    });
+    expect(active.data.map((run) => [run.runId, run.status])).toEqual([
+      [pending.run.runId, 'pending'],
+      [running, 'running'],
+    ]);
+    const onlyRunning = await world.runs.list({ status: 'running' });
+    expect(onlyRunning.data.map((run) => run.runId)).toEqual([running]);
+
+    expect((await rawItem(runMetaKey(running)))?.GSI3PK).toEqual({
+      S: 'ACTIVE',
+    });
+    expect((await rawItem(runMetaKey(completed)))?.GSI3PK).toBeUndefined();
+    expect((await rawItem(runMetaKey(cancelled)))?.GSI3SK).toBeUndefined();
+    // The terminal ones are still listed by status from every run.
+    const ended = await world.runs.list({ status: ['completed', 'cancelled'] });
+    expect(ended.data.map((run) => run.runId).sort()).toEqual(
+      [completed, cancelled].sort()
+    );
+  });
+
   it('answers a disposal that lost to a concurrent one with a conflict, as world-postgres', async () => {
     const runId = await runningRun();
     await world.events.create(runId, {

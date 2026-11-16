@@ -11,9 +11,11 @@ import {
   validateAttributeChanges,
 } from '@workflow/world';
 import {
+  ACTIVE_RUNS_GSI3PK,
   ALL_RUNS_GSI1PK,
   GSI1_NAME,
   GSI2_NAME,
+  GSI3_NAME,
   PREFIX,
   runMetaKey,
 } from '../keys.js';
@@ -84,13 +86,24 @@ export function createRunsStorage(
         return { data: [], cursor: null, hasMore: false };
       }
       const byWorkflow = params?.workflowName !== undefined;
-      const indexKeys = byWorkflow
-        ? ['GSI2PK', 'GSI2SK']
-        : ['GSI1PK', 'GSI1SK'];
-      const partition = byWorkflow
-        ? `${PREFIX.runsByWorkflow}${params?.workflowName}`
-        : ALL_RUNS_GSI1PK;
-      const scope = `${byWorkflow ? GSI2_NAME : GSI1_NAME}:${partition}`;
+      // Only runs that have not ended, as recovery lists them: the sparse
+      // active-runs index holds just those, so the read does not grow with
+      // every run the table ever held.
+      const activeOnly =
+        !byWorkflow &&
+        statuses !== undefined &&
+        statuses.every((status) => !isTerminalWorkflowRunStatus(status));
+      const [indexName, indexKeys, partition]: [string, string[], string] =
+        byWorkflow
+          ? [
+              GSI2_NAME,
+              ['GSI2PK', 'GSI2SK'],
+              `${PREFIX.runsByWorkflow}${params?.workflowName}`,
+            ]
+          : activeOnly
+            ? [GSI3_NAME, ['GSI3PK', 'GSI3SK'], ACTIVE_RUNS_GSI3PK]
+            : [GSI1_NAME, ['GSI1PK', 'GSI1SK'], ALL_RUNS_GSI1PK];
+      const scope = `${indexName}:${partition}`;
       const values: Record<string, unknown> = { ':pk': partition };
       statuses?.forEach((status, i) => {
         values[`:s${i}`] = status;
@@ -98,7 +111,7 @@ export function createRunsStorage(
       const cursor = params?.pagination?.cursor;
       const items = await table.collect(
         {
-          IndexName: byWorkflow ? GSI2_NAME : GSI1_NAME,
+          IndexName: indexName,
           KeyConditionExpression: `${indexKeys[0]} = :pk`,
           ...(statuses && {
             FilterExpression: `#status IN (${statuses.map((_, i) => `:s${i}`).join(', ')})`,
