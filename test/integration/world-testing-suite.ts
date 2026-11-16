@@ -11,7 +11,11 @@
  *   loaded from there (`pnpm build` is not a prerequisite);
  * - before each test the `WORKFLOW_AWS_*` variables are pointed at a fresh
  *   table and fresh queues, so no server picks up another test's messages
- *   or recovers another test's runs.
+ *   or recovers another test's runs, and at the emulator's bucket, with
+ *   live stream reads polling every 50 ms.
+ *
+ * Every test of the suite runs: the only ones it skips are its own
+ * (queue-auth tests for `queueAuthMode: 'loopback'` Worlds).
  */
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -28,6 +32,7 @@ import {
   createClients,
   destroyClients,
 } from '../../src/clients.js';
+import { DEFAULT_MAX_RECEIVE_COUNT } from '../../src/queue/index.js';
 
 const aws = inject('aws');
 const root = path.resolve(fileURLToPath(import.meta.url), '../../..');
@@ -37,19 +42,6 @@ const suite = (name: string) =>
   createRequire(import.meta.url).resolve(
     `@workflow/world-testing/dist/src/${name}.mjs`
   );
-
-/**
- * Tests of the suite this World cannot pass yet, by name, with the reason.
- * Every one of them reads or writes a stream, which is M3.
- */
-const SKIPPED: Record<string, string> = {
-  hooks:
-    'Streams are M3: the workflow writes to getWritable() and the test reads the run with getReadable() (streams.write and streams.get throw NotImplementedError)',
-  'queue health checks still pass through the route':
-    'Streams are M3: a queue health check answers on a stream (streams.write throws NotImplementedError)',
-  'sequential steps with stream complete in a single flow invocation':
-    'Streams are M3: its steps write to getWritable() (streams.write throws NotImplementedError)',
-};
 
 type Suite = (world: string) => void;
 const load = async (name: string, exported: string) =>
@@ -81,11 +73,6 @@ export async function registerWorldTestingSuite(
     clients = createClients({ region: aws.region, endpoint: aws.endpoint });
   }, 120_000);
 
-  beforeEach((context) => {
-    const reason = SKIPPED[context.task.name];
-    if (reason) context.skip(reason);
-  });
-
   beforeEach(async () => {
     const id = randomUUID().slice(0, 8);
     const tableName = `wf-spec-${id}`;
@@ -93,13 +80,13 @@ export async function registerWorldTestingSuite(
     const workflow = await createQueueWithDeadLetter(
       clients.sqs,
       `spec-${id}-wf`,
-      73,
+      DEFAULT_MAX_RECEIVE_COUNT,
       60
     );
     const step = await createQueueWithDeadLetter(
       clients.sqs,
       `spec-${id}-step`,
-      73,
+      DEFAULT_MAX_RECEIVE_COUNT,
       60
     );
     Object.assign(process.env, {
@@ -108,7 +95,9 @@ export async function registerWorldTestingSuite(
       WORKFLOW_AWS_TABLE: tableName,
       WORKFLOW_AWS_WORKFLOW_QUEUE_URL: workflow.queueUrl,
       WORKFLOW_AWS_STEP_QUEUE_URL: step.queueUrl,
+      WORKFLOW_AWS_BUCKET: aws.bucket,
       WORKFLOW_AWS_POLL_WAIT_SECONDS: '1',
+      WORKFLOW_AWS_STREAM_POLL_INTERVAL_MS: '50',
     });
   }, 60_000);
 
