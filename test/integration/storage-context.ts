@@ -103,7 +103,7 @@ export interface StorageTestContext {
   clients: AwsClients;
   tableName: string;
   /** A new World over the same table, as another process would have. */
-  secondWorld(): World;
+  secondWorld(options?: { bucket?: string }): World;
   /** Deletes every item, like world-postgres' TRUNCATE between tests. */
   truncate(): Promise<void>;
   /**
@@ -126,12 +126,23 @@ export interface StorageTestContext {
   close(): Promise<void>;
 }
 
+/** Bucket and key of an `s3://bucket/key` reference. */
+export function s3Location(ref: string): { bucket: string; key: string } {
+  const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(ref);
+  if (!match) throw new Error(`Not an S3 reference: ${ref}`);
+  return { bucket: match[1] as string, key: match[2] as string };
+}
+
+/** How often the suites' live stream readers poll: short, for speed. */
+export const TEST_STREAM_POLL_INTERVAL_MS = 20;
+
 const baseOptions = () => ({
   region: aws.region,
   endpoint: aws.endpoint,
   workflowQueueUrl: aws.workflowQueueUrl,
   stepQueueUrl: aws.stepQueueUrl,
   bucket: aws.bucket,
+  streamPollIntervalMs: TEST_STREAM_POLL_INTERVAL_MS,
 });
 
 export async function createStorageTestContext(
@@ -148,15 +159,23 @@ export async function createStorageTestContext(
   };
   const clients = newClients();
   await createWorkflowTable(clients, tableName);
-  const newWorld = (worldClients: AwsClients) =>
-    createWorld({ ...baseOptions(), tableName, clients: worldClients });
+  const newWorld = (
+    worldClients: AwsClients,
+    overrides: { bucket?: string } = {}
+  ) =>
+    createWorld({
+      ...baseOptions(),
+      ...overrides,
+      tableName,
+      clients: worldClients,
+    });
   const world = newWorld(clients);
 
   return {
     world,
     clients,
     tableName,
-    secondWorld: () => newWorld(newClients()),
+    secondWorld: (overrides) => newWorld(newClients(), overrides),
     async truncate() {
       let startKey: ScanCommandOutput['LastEvaluatedKey'];
       do {
