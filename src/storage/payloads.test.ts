@@ -18,7 +18,7 @@ import {
   type TransactWriteCommandInput,
 } from '@aws-sdk/lib-dynamodb';
 import { mockClient } from 'aws-sdk-client-mock';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage } from './index.js';
 import {
   isS3Ref,
@@ -118,13 +118,13 @@ function transactions(): TransactWriteCommandInput[] {
 const bytes = (size: number, seed = 7) =>
   new Uint8Array(size).map((_, i) => (i * seed) % 251);
 
-describe('S3 offload of payloads too large for an item', () => {
-  const stepCreated = (input: Uint8Array) => ({
-    eventType: 'step_created' as const,
-    correlationId: 'step_1',
-    eventData: { stepName: 'add', input },
-  });
+const stepCreated = (input: Uint8Array) => ({
+  eventType: 'step_created' as const,
+  correlationId: 'step_1',
+  eventData: { stepName: 'add', input },
+});
 
+describe('S3 offload of payloads too large for an item', () => {
   it('writes the values to S3, keeps references in the items, and reads them back', async () => {
     const items: Record<string, Record<string, unknown>> = {
       [`RUN#${runId}|META`]: runItem(),
@@ -348,7 +348,7 @@ describe('S3 offload of payloads too large for an item', () => {
     expect(transactions()).toHaveLength(0);
   });
 
-  it('deletes the object of a snapshot it replaces, and uploads equal content once', async () => {
+  it('deletes the object of a snapshot it replaces', async () => {
     let stored: Record<string, unknown> | undefined;
     ddb.on(PutCommand).callsFake((input: { Item: Record<string, unknown> }) => {
       const old = stored;
@@ -370,16 +370,163 @@ describe('S3 offload of payloads too large for an item', () => {
       'ALL_OLD'
     );
 
-    await snapshots?.save(runId, bytes(400 * 1024), metadata);
-    expect(s3Mock.commandCalls(PutObjectCommand)).toHaveLength(1);
-    expect(s3Mock.commandCalls(DeleteObjectCommand)).toHaveLength(0);
-
     await snapshots?.save(runId, bytes(400 * 1024, 11), metadata);
     expect(s3Mock.commandCalls(PutObjectCommand)).toHaveLength(2);
     expect(s3Mock.commandCalls(DeleteObjectCommand)[0]?.args[0].input).toEqual({
       Bucket: bucket,
       Key: first.slice(`s3://${bucket}/`.length),
     });
+  });
+
+  describe('a snapshot saved again by several processes', () => {
+    /** The run's snapshot item, as the mocked table holds it. */
+    let stored: Record<string, unknown> | undefined;
+    const metadata = { eventsCursor: 'evnt_1', createdAt: Date.now() } as never;
+    /** The snapshot storage of another process (its own payload store). */
+    const otherProcess = () =>
+      createStorage({
+        documents,
+        tableName: 'wf',
+        payloads: new PayloadStore({ s3, bucket }),
+      }).experimental_snapshots;
+
+    beforeEach(() => {
+      stored = undefined;
+      ddb
+        .on(PutCommand)
+        .callsFake((input: { Item: Record<string, unknown> }) => {
+          const old = stored;
+          stored = input.Item;
+          return { Attributes: old };
+        });
+      ddb.on(GetCommand).callsFake(() => ({ Item: stored }));
+      s3Mock.on(DeleteObjectCommand).callsFake((input: { Key: string }) => {
+        objects.delete(input.Key);
+        return {};
+      });
+    });
+
+    it('stays readable when another process replaced it in between', async () => {
+      const a = otherProcess();
+      const b = otherProcess();
+      const x = bytes(400 * 1024);
+
+      // A saves X, B replaces it with Y (deleting X's object), and A saves
+      // X again right away.
+      await a?.save(runId, x, metadata);
+      await b?.save(runId, bytes(400 * 1024, 11), metadata);
+      await a?.save(runId, x, metadata);
+
+      const loaded = await otherProcess()?.load(runId);
+      expect(loaded?.data).toEqual(x);
+    });
+
+    it('stays readable when a replaced object is deleted after an equal save', async () => {
+      const a = otherProcess();
+      const b = otherProcess();
+      const c = otherProcess();
+      const x = bytes(400 * 1024);
+      await a?.save(runId, x, metadata);
+
+      // B replaces X with Y, but its delete of X's object lands only after C
+      // has saved X again.
+      let releaseDelete!: () => void;
+      const held = new Promise<void>((resolve) => (releaseDelete = resolve));
+      s3Mock
+        .on(DeleteObjectCommand)
+        .callsFakeOnce(async (input: { Key: string }) => {
+          await held;
+          objects.delete(input.Key);
+          return {};
+        })
+        .callsFake((input: { Key: string }) => {
+          objects.delete(input.Key);
+          return {};
+        });
+      const replacing = b?.save(runId, bytes(400 * 1024, 11), metadata);
+      await vi.waitFor(() =>
+        expect(s3Mock.commandCalls(DeleteObjectCommand)).toHaveLength(1)
+      );
+      await c?.save(runId, x, metadata);
+      releaseDelete();
+      await replacing;
+
+      const loaded = await otherProcess()?.load(runId);
+      expect(loaded?.data).toEqual(x);
+    });
+  });
+
+  it('uploads a value once across the retries of one commit', async () => {
+    serve({ [`RUN#${runId}|META`]: runItem() });
+    ddb
+      .on(TransactWriteCommand)
+      .rejectsOnce(
+        Object.assign(new Error('Transaction cancelled'), {
+          name: 'TransactionCanceledException',
+          CancellationReasons: [{ Code: 'TransactionConflict' }],
+        })
+      )
+      .resolves({});
+    const storage = createStorage({
+      documents,
+      tableName: 'wf',
+      payloads: new PayloadStore({ s3, bucket }),
+    });
+
+    await storage.events.create(runId, stepCreated(bytes(400 * 1024)));
+    expect(transactions()).toHaveLength(2);
+    // The step's input and the event's data, once each.
+    expect(s3Mock.commandCalls(PutObjectCommand)).toHaveLength(2);
+  });
+
+  it('keeps a transaction a margin below 4 MB for what DynamoDB also counts', async () => {
+    ddb.on(TransactWriteCommand).resolves({});
+    const table = new Table(documents, 'wf', new PayloadStore({ s3, bucket }));
+    // Thirteen items of 300 KB: 3.9 MB, under 4 MB but not by enough.
+    await table.transact(
+      Array.from({ length: 13 }, (_, i) => ({
+        Put: {
+          Item: {
+            PK: `STREAM#${runId}#out`,
+            SK: `CHUNK#${String(i).padStart(10, '0')}`,
+            data: bytes(300 * 1024),
+          },
+        },
+      }))
+    );
+
+    const datas = (transactions()[0]?.TransactItems ?? []).map(
+      (entry) => entry.Put?.Item?.data
+    );
+    expect(datas.filter(isS3Ref).length).toBeGreaterThan(0);
+    const inlineBytes = datas
+      .filter((data) => data instanceof Uint8Array)
+      .reduce((sum, data) => sum + (data as Uint8Array).byteLength, 0);
+    expect(inlineBytes).toBeLessThanOrEqual(4 * 1024 * 1024 - 256 * 1024);
+  });
+
+  it('names the bucket and WORKFLOW_AWS_BUCKET when the bucket does not exist', async () => {
+    serve({ [`RUN#${runId}|META`]: runItem() });
+    s3Mock.on(PutObjectCommand).rejects(
+      Object.assign(new Error('The specified bucket does not exist'), {
+        name: 'NoSuchBucket',
+      })
+    );
+    const storage = createStorage({
+      documents,
+      tableName: 'wf',
+      payloads: new PayloadStore({ s3, bucket: 'no-such-bucket' }),
+    });
+
+    const write = storage.events.create(runId, stepCreated(bytes(400 * 1024)));
+    await expect(write).rejects.toMatchObject({
+      name: 'PayloadBucketError',
+      code: 'PAYLOAD_BUCKET_NOT_FOUND',
+      bucket: 'no-such-bucket',
+    });
+    await expect(write).rejects.toThrow(/"no-such-bucket"/);
+    await expect(write).rejects.toThrow(/WORKFLOW_AWS_BUCKET/);
+    expect(transactions()).toHaveLength(0);
   });
 });
 
