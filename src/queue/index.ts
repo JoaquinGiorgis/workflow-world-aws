@@ -12,6 +12,8 @@
  *   to the handler registered for its prefix in this process, or over HTTP
  *   to the app's route.
  * - `createQueueHandler()` is the route side (`handler.ts`).
+ * - `handleSqsEvent()` is Lambda mode: the same deliveries, from the
+ *   records of an SQS event source mapping (`lambda.ts`).
  */
 import {
   SendMessageBatchCommand,
@@ -42,9 +44,14 @@ import {
   scheduleOf,
   sendQueueMessage,
 } from './consumer.js';
-import { deliver } from './delivery.js';
+import { type Delivery, deliver } from './delivery.js';
 import { createQueueHandler } from './handler.js';
 import { IdempotencyStore } from './idempotency.js';
+import {
+  handleSqsEvent,
+  type SqsBatchResponse,
+  type SqsLambdaEvent,
+} from './lambda.js';
 import {
   encodeForQueue,
   MESSAGE_FORMAT_VERSION,
@@ -116,6 +123,11 @@ export type SqsQueue = Queue &
      * `close()` waits too.
      */
     settled(): Promise<void>;
+    /**
+     * Lambda mode: handles the records of an SQS event source mapping's
+     * event and answers the ones to leave in the queue (`lambda.ts`).
+     */
+    handleSqsEvent(event: SqsLambdaEvent): Promise<SqsBatchResponse>;
     start(): Promise<void>;
     close(): Promise<void>;
   };
@@ -398,6 +410,17 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
 
   const canStartWorker = () => !closed && !consumer && !shared.consumer;
 
+  const deliverHere = (delivery: Delivery) =>
+    deliver(
+      {
+        handlers: shared.handlers,
+        routes: shared.routes,
+        ...(options.baseUrl !== undefined && { baseUrl: options.baseUrl }),
+        agents,
+      },
+      delivery
+    );
+
   const startWorker = async (): Promise<boolean> => {
     if (!canStartWorker()) return false;
     consumer = new Consumer({
@@ -409,16 +432,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
       shutdownGraceMs: options.shutdownGraceMs,
       runGate: shared.runGate,
       ...(options.payloads && { payloads: options.payloads }),
-      deliver: (delivery) =>
-        deliver(
-          {
-            handlers: shared.handlers,
-            routes: shared.routes,
-            ...(options.baseUrl !== undefined && { baseUrl: options.baseUrl }),
-            agents,
-          },
-          delivery
-        ),
+      deliver: deliverHere,
       ...options.internal,
     });
     shared.consumer = consumer;
@@ -443,6 +457,26 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
     },
     startWorker,
     canStartWorker,
+    async handleSqsEvent(event) {
+      const response = await handleSqsEvent(
+        {
+          sqs,
+          queueUrls: [workflowQueueUrl, stepQueueUrl],
+          concurrency: options.concurrency,
+          runGate: shared.runGate,
+          deliver: deliverHere,
+          ...(options.payloads && { payloads: options.payloads }),
+          ...(options.internal?.retryDelaySeconds && {
+            retryDelaySeconds: options.internal.retryDelaySeconds,
+          }),
+          log,
+        },
+        event
+      );
+      // Lambda may freeze the process once the function answers.
+      await settled();
+      return response;
+    },
     async start() {
       await startWorker();
     },

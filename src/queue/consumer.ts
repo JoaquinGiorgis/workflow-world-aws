@@ -140,6 +140,27 @@ export async function sendQueueMessage(
   );
 }
 
+/** Sends an early hop of a long delay on with the rest of its delay. */
+export async function sendOnTowardNotBefore(
+  sqs: SQSClient,
+  queueUrl: string,
+  message: QueueMessage,
+  payloads?: PayloadStore
+): Promise<void> {
+  const notBefore = message.notBefore ?? Date.now();
+  debugLog('queue message sent on toward its notBefore', {
+    ...traceOf(message),
+    notBefore: new Date(notBefore).toISOString(),
+  });
+  await sendQueueMessage(
+    sqs,
+    queueUrl,
+    message,
+    (notBefore - Date.now()) / 1000,
+    payloads
+  );
+}
+
 export interface ConsumerOptions {
   sqs: SQSClient;
   queueUrls: readonly string[];
@@ -362,20 +383,14 @@ export class Consumer {
     received: Message,
     slot: Slot
   ): Promise<void> {
-    const receiveCount = Math.max(
-      1,
-      Number(received.Attributes?.ApproximateReceiveCount ?? 1) || 1
-    );
+    const receiveCount = receiveCountOf(received.Attributes);
     const receipt = received.ReceiptHandle ?? '';
     const { payloads } = this.options;
     let message: QueueMessage;
     /** The S3 body of this SQS message, deleted with it. */
     let bodyRef: S3Ref | undefined;
     try {
-      message = decodeMessage(received.Body);
-      bodyRef = message.bodyRef;
-      message = await resolveMessage(message, payloads);
-      parseQueueName(message.queueName as ValidQueueName);
+      ({ message, bodyRef } = await readReceived(received.Body, payloads));
     } catch (error) {
       // Not something this World sent (or its S3 body is gone): back off,
       // and let the redrive policy move it to the dead-letter queue.
@@ -388,19 +403,11 @@ export class Consumer {
       return;
     }
 
-    if (
-      message.notBefore !== undefined &&
-      message.notBefore - Date.now() > EARLY_DELIVERY_TOLERANCE_MS
-    ) {
-      debugLog('queue message sent on toward its notBefore', {
-        ...traceOf(message),
-        notBefore: new Date(message.notBefore).toISOString(),
-      });
-      await sendQueueMessage(
+    if (isEarlyHop(message)) {
+      await sendOnTowardNotBefore(
         this.options.sqs,
         queueUrl,
         message,
-        (message.notBefore - Date.now()) / 1000,
         payloads
       );
       await this.acknowledge(queueUrl, receipt, bodyRef);
@@ -634,7 +641,7 @@ export function followUp(
 }
 
 /** What the DEBUG trace says about a message. */
-function traceOf(message: QueueMessage): Record<string, unknown> {
+export function traceOf(message: QueueMessage): Record<string, unknown> {
   const payload = (message.payload ?? {}) as {
     runId?: unknown;
     stepId?: unknown;
@@ -648,15 +655,44 @@ function traceOf(message: QueueMessage): Record<string, unknown> {
 }
 
 /** The in-process gate key of a spec 9 orchestrator delivery. */
-function runGateKey(message: QueueMessage): string | undefined {
+export function runGateKey(message: QueueMessage): string | undefined {
   const runId = singleOrchestratorRunIdOf(message.payload);
   if (runId === undefined) return undefined;
   const { prefix } = parseQueueName(message.queueName as ValidQueueName);
   return `${prefix}${runId}`;
 }
 
-function describe(error: unknown): string {
+export function describe(error: unknown): string {
   return error instanceof Error
     ? `${error.name}: ${error.message}`
     : String(error);
+}
+
+/** SQS's receive count of a message, at least 1. */
+export function receiveCountOf(
+  attributes: Record<string, string | undefined> | undefined
+): number {
+  return Math.max(1, Number(attributes?.ApproximateReceiveCount ?? 1) || 1);
+}
+
+/**
+ * Whether a received message is a hop of a long delay that arrived before
+ * its `notBefore`, to be sent on rather than delivered.
+ */
+export function isEarlyHop(message: QueueMessage, now = Date.now()): boolean {
+  return (
+    message.notBefore !== undefined &&
+    message.notBefore - now > EARLY_DELIVERY_TOLERANCE_MS
+  );
+}
+
+/** A received message decoded, its S3 body read, and its queue name checked. */
+export async function readReceived(
+  body: string | undefined,
+  payloads: PayloadStore | undefined
+): Promise<{ message: QueueMessage; bodyRef: S3Ref | undefined }> {
+  const pointer = decodeMessage(body);
+  const message = await resolveMessage(pointer, payloads);
+  parseQueueName(message.queueName as ValidQueueName);
+  return { message, bodyRef: pointer.bodyRef };
 }

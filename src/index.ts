@@ -7,6 +7,7 @@ import {
 import { type AwsClients, createClients, destroyClients } from './clients.js';
 import { type AwsWorldOptions, resolveConfig } from './config.js';
 import { createSqsQueue } from './queue/index.js';
+import type { SqsBatchResponse, SqsLambdaEvent } from './queue/lambda.js';
 import { RecoveryGuard } from './recovery.js';
 import {
   createStorage,
@@ -50,6 +51,12 @@ export type AwsWorld = World &
      * handler of `createSqsLambdaHandler()` does.
      */
     recover(): Promise<boolean>;
+    /**
+     * Lambda mode: delivers the records of an SQS event and answers the
+     * ones to leave in the queue. Usually through
+     * {@link createSqsLambdaHandler}.
+     */
+    handleSqsEvent(event: SqsLambdaEvent): Promise<SqsBatchResponse>;
     close(): Promise<void>;
   };
 
@@ -153,6 +160,7 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
     createQueueHandler: queue.createQueueHandler,
     registerHandler: queue.registerHandler,
     registerRoute: queue.registerRoute,
+    handleSqsEvent: queue.handleSqsEvent,
 
     streams: streamer.streams,
 
@@ -187,6 +195,78 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
 
 export default createWorld;
 
+export interface SqsLambdaHandlerOptions {
+  /**
+   * The World to deliver with, or a function that creates it, called on
+   * the first event. Default: `createWorld()` from the `WORKFLOW_AWS_*`
+   * variables. Register the in-process handler on it
+   * (`world.registerHandler('__wkf_workflow_', POST)` with the `POST` of
+   * the app's built flow route), or deliveries go over HTTP to `baseUrl`.
+   */
+  world?: AwsWorld | (() => AwsWorld | Promise<AwsWorld>);
+  /**
+   * Whether the first event a process handles also runs `world.recover()`
+   * (at most once per `recoveryIntervalSeconds` per table, across
+   * processes). Default true: in Lambda mode nothing else recovers runs
+   * whose next message was lost.
+   */
+  recover?: boolean;
+}
+
+/**
+ * Creates the handler of a Lambda function behind an SQS event source
+ * mapping on the World's workflow and step queues. It answers
+ * `{ batchItemFailures }`, so the mapping needs
+ * `FunctionResponseTypes: ['ReportBatchItemFailures']`: without it Lambda
+ * deletes every record of a batch whose function did not throw, failed
+ * ones included. Give the queues a visibility timeout of at least the
+ * function's timeout (AWS recommends six times it).
+ *
+ * ```ts
+ * import { createSqsLambdaHandler, createWorld } from '@joaquingiorgis/world-aws';
+ * import { POST } from './.well-known/workflow/v1/flow.mjs';
+ *
+ * const world = createWorld();
+ * world.registerHandler('__wkf_workflow_', POST);
+ * export const handler = createSqsLambdaHandler({ world });
+ * ```
+ */
+export function createSqsLambdaHandler(
+  options: SqsLambdaHandlerOptions = {}
+): (event: SqsLambdaEvent, context?: unknown) => Promise<SqsBatchResponse> {
+  let world: Promise<AwsWorld> | undefined;
+  let recovered = options.recover === false;
+
+  const recoverOnce = async (target: AwsWorld) => {
+    if (recovered) return;
+    try {
+      await target.recover();
+      recovered = true;
+    } catch (error) {
+      console.warn(
+        '[world-aws] Could not recover the runs that have not ended; trying again on the next event',
+        { error: error instanceof Error ? error.message : String(error) }
+      );
+    }
+  };
+
+  return async (event) => {
+    world ??= (async () => {
+      const given = options.world;
+      return typeof given === 'function' ? given() : (given ?? createWorld());
+    })().catch((error: unknown) => {
+      world = undefined;
+      throw error;
+    });
+    const target = await world;
+    // Next to the records, so a long recovery does not hold them up.
+    const recovery = recoverOnce(target);
+    const response = await target.handleSqsEvent(event);
+    await recovery;
+    return response;
+  };
+}
+
 export { type AwsClients, createClients, destroyClients } from './clients.js';
 export {
   type AwsWorldConfig,
@@ -200,6 +280,11 @@ export {
   type SqsQueue,
   type SqsQueueOptions,
 } from './queue/index.js';
+export type {
+  SqsBatchResponse,
+  SqsLambdaEvent,
+  SqsLambdaRecord,
+} from './queue/lambda.js';
 export {
   MAX_ITEM_BYTES,
   MISSING_TABLE_INDEX_CODE,
