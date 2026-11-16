@@ -12,6 +12,9 @@ import {
   type RetryOptions,
   STORAGE_CAPABILITIES,
 } from './storage/index.js';
+import { PayloadStore } from './storage/payloads.js';
+import { Table } from './storage/table.js';
+import { createStreamer } from './streams/index.js';
 
 export interface CreateWorldOptions extends AwsWorldOptions {
   /**
@@ -30,25 +33,6 @@ export interface CreateWorldOptions extends AwsWorldOptions {
   retry?: Partial<RetryOptions>;
 }
 
-/** Thrown by the stream methods (until M3). */
-export class NotImplementedError extends Error {
-  constructor(method: string, milestone: 'M3') {
-    super(
-      `@joaquingiorgis/world-aws: ${method} is not implemented yet (${milestone})`
-    );
-    this.name = 'NotImplementedError';
-  }
-}
-
-function notImplemented(
-  method: string,
-  milestone: 'M3'
-): (...args: unknown[]) => never {
-  return () => {
-    throw new NotImplementedError(method, milestone);
-  };
-}
-
 /** The AWS World: a `World` whose optional queue methods are all there. */
 export type AwsWorld = World &
   Required<Pick<Queue, 'queueBatch' | 'registerHandler' | 'registerRoute'>> & {
@@ -59,11 +43,11 @@ export type AwsWorld = World &
 /**
  * Creates the AWS World.
  *
- * Storage (runs, steps, events, hooks, VM snapshots) lives in one DynamoDB
- * table, and the queue on two SQS standard queues (workflow and step).
- * `start()` re-enqueues the runs that have not ended and runs the queue
- * worker in this process. Streams (M3) are not implemented yet and throw
- * {@link NotImplementedError}.
+ * Storage (runs, steps, events, hooks, VM snapshots) and streams live in
+ * one DynamoDB table, the queue on two SQS standard queues (workflow and
+ * step), and values too large for either in the S3 bucket, when one is
+ * configured. `start()` re-enqueues the runs that have not ended and runs
+ * the queue worker in this process.
  *
  * @param options - Explicit settings; anything left out is read from the
  *   `WORKFLOW_AWS_*` environment variables.
@@ -71,10 +55,20 @@ export type AwsWorld = World &
 export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
   const config = resolveConfig(process.env, options);
   const clients = options.clients ?? createClients(config);
+  // Reads resolve payloads in S3 even without a bucket configured now.
+  const payloads = new PayloadStore({
+    s3: clients.s3,
+    ...(config.bucket !== undefined && { bucket: config.bucket }),
+  });
   const storage = createStorage({
     documents: clients.documents,
     tableName: config.tableName,
+    payloads,
     ...(options.retry && { retry: options.retry }),
+  });
+  const streamer = createStreamer({
+    table: new Table(clients.documents, config.tableName, payloads),
+    pollIntervalMs: config.streamPollIntervalMs,
   });
   const queue = createSqsQueue({
     sqs: clients.sqs,
@@ -88,6 +82,7 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
     visibilityTimeoutSeconds: config.visibilityTimeoutSeconds,
     pollWaitSeconds: config.pollWaitSeconds,
     shutdownGraceMs: config.shutdownGraceMs,
+    payloads,
   });
   let closing: Promise<void> | undefined;
   let starting: Promise<void> | undefined;
@@ -112,14 +107,7 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
     registerHandler: queue.registerHandler,
     registerRoute: queue.registerRoute,
 
-    streams: {
-      write: notImplemented('streams.write', 'M3'),
-      close: notImplemented('streams.close', 'M3'),
-      get: notImplemented('streams.get', 'M3'),
-      list: notImplemented('streams.list', 'M3'),
-      getChunks: notImplemented('streams.getChunks', 'M3'),
-      getInfo: notImplemented('streams.getInfo', 'M3'),
-    },
+    streams: streamer.streams,
 
     start() {
       // Recovery, as world-postgres does on start: every run that has not
@@ -143,6 +131,7 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
 
     close() {
       closing ??= (async () => {
+        await streamer.close();
         await queue.close();
         if (!options.clients) destroyClients(clients);
       })();

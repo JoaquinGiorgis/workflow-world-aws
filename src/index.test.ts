@@ -16,7 +16,6 @@ import {
   createClients,
   createWorld,
   destroyClients,
-  NotImplementedError,
 } from './index.js';
 
 const options = {
@@ -75,7 +74,7 @@ describe('createWorld', () => {
     await world.close?.();
   });
 
-  it('implements the queue and throws "(M3)" from streams', async () => {
+  it('implements the queue', async () => {
     const world = createWorld(options);
     expect(world.queueAuthMode).toBe('skip');
     expect(await world.getDeploymentId()).toBe('aws');
@@ -84,15 +83,46 @@ describe('createWorld', () => {
     expect(typeof world.createQueueHandler('__wkf_workflow_', vi.fn())).toBe(
       'function'
     );
-    const calls: [string, () => unknown][] = [
-      ['streams.write', () => world.streams.write('wrun_x', 's', 'chunk')],
-      ['streams.get', () => world.streams.get('wrun_x', 's')],
-    ];
-    for (const [method, call] of calls) {
-      expect(call).toThrow(NotImplementedError);
-      expect(call).toThrow(`${method} is not implemented yet (M3)`);
-    }
     await world.close();
+  });
+
+  it('implements streams, with every reader stopped by close()', async () => {
+    const clients = createClients(options);
+    const ddb = mockClient(clients.documents);
+    ddb.on(QueryCommand).resolves({ Items: [] });
+    ddb.on(GetCommand).resolves({});
+    const world = createWorld({
+      ...options,
+      clients,
+      streamPollIntervalMs: 10,
+    });
+    try {
+      for (const method of [
+        'write',
+        'writeMulti',
+        'close',
+        'get',
+        'list',
+        'getChunks',
+        'getInfo',
+      ] as const) {
+        expect(typeof world.streams[method]).toBe('function');
+      }
+      // No write session: the runtime uses the stateless methods, as with
+      // world-postgres.
+      expect(world.streams.createWriteSession).toBeUndefined();
+      const reader = (await world.streams.get('wrun_x', 's')).getReader();
+      const pending = reader.read();
+      await world.close();
+      await expect(pending).rejects.toThrow('the AWS World has been closed');
+      await expect(world.streams.get('wrun_x', 's')).rejects.toThrow(
+        'the AWS World has been closed'
+      );
+    } finally {
+      await world.close();
+      ddb.restore();
+      destroyClients(clients);
+    }
   });
 
   it('re-enqueues the runs that have not ended when it starts', async () => {
