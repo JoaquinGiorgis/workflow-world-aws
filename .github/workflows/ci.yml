@@ -43,15 +43,14 @@ jobs:
         run: pnpm pack --dry-run
 
   # The whole integration suite (storage, queue, streams, S3 offload and
-  # @workflow/world-testing at spec 8 and 9) against LocalStack. Newer
-  # LocalStack images may refuse to start without an auth token: then set
-  # the LOCALSTACK_AUTH_TOKEN repository secret. Secrets cannot gate a job,
-  # so it runs only when the repository variable LOCALSTACK_ENABLED is
-  # "true"; the moto job below runs the same suite without any token.
+  # @workflow/world-testing at spec 8 and 9) against LocalStack, on every
+  # run: unlike moto, LocalStack runs a TransactWriteItems in isolation, as
+  # DynamoDB does. The community image needs no auth token; a
+  # LOCALSTACK_AUTH_TOKEN secret, if the repository sets one, is passed on
+  # (an unset secret is an empty string, which LocalStack ignores).
   integration-localstack:
     name: Integration tests (LocalStack)
     runs-on: ubuntu-latest
-    if: ${{ vars.LOCALSTACK_ENABLED == 'true' }}
     services:
       localstack:
         image: localstack/localstack:4
@@ -83,7 +82,9 @@ jobs:
       # start moto_server. It sets dummy credentials itself.
       - run: pnpm test:integration
 
-  # The same suite against moto_server, which needs no account or token.
+  # The same suite against moto_server, the alternative that needs no
+  # image or token. Pinned to a major so a moto release cannot break CI
+  # unrelated to a change.
   integration-moto:
     name: Integration tests (moto_server)
     runs-on: ubuntu-latest
@@ -100,7 +101,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install moto_server
-        run: pip install "moto[server]"
+        run: pip install "moto[server]>=5,<6"
       - name: Enable corepack
         run: corepack enable
       - run: pnpm install --frozen-lockfile
