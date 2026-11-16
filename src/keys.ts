@@ -18,6 +18,7 @@
  * | Stream end marker      | `STREAM#<runId>#<name>`  | `CLOSED`            |
  * | Stream name (per run)  | `STREAMS#<runId>`        | `NAME#<name>`       |
  * | Queue idempotency      | `IDEMP#<key>`            | `Q`                 |
+ * | Last startup recovery  | `RECOVERY`               | `LAST`              |
  *
  * Event ids are slots (`evnt_` and a 26-digit zero-padded position), so
  * `EVT#<eventId>` sorts in log order. Chunk sequence numbers are zero-padded
@@ -238,6 +239,9 @@ export function streamNameKey(runId: string, name: string): TableKey {
     SK: `${PREFIX.streamName}${requireComponent(name, 'stream name')}`,
   };
 }
+
+/** The one item recording the table's last startup recovery. */
+export const RECOVERY_KEY: TableKey = { PK: 'RECOVERY', SK: 'LAST' };
 
 export function idempotencyKey(key: string): TableKey {
   return {

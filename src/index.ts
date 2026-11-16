@@ -7,11 +7,13 @@ import {
 import { type AwsClients, createClients, destroyClients } from './clients.js';
 import { type AwsWorldOptions, resolveConfig } from './config.js';
 import { createSqsQueue } from './queue/index.js';
+import { RecoveryGuard } from './recovery.js';
 import {
   createStorage,
   type RetryOptions,
   STORAGE_CAPABILITIES,
 } from './storage/index.js';
+import { debugLog } from './storage/log.js';
 import { PayloadStore } from './storage/payloads.js';
 import { Table } from './storage/table.js';
 import { createStreamer } from './streams/index.js';
@@ -36,7 +38,18 @@ export interface CreateWorldOptions extends AwsWorldOptions {
 /** The AWS World: a `World` whose optional queue methods are all there. */
 export type AwsWorld = World &
   Required<Pick<Queue, 'queueBatch' | 'registerHandler' | 'registerRoute'>> & {
+    /**
+     * Recovers (re-enqueues the runs that have not ended) and then runs
+     * the queue worker in this process. See {@link AwsWorld.recover}.
+     */
     start(): Promise<void>;
+    /**
+     * Re-enqueues every run that has not ended, unless a process recovered
+     * this table within `recoveryIntervalSeconds`. Resolves whether it
+     * recovered. `start()` calls it; without a worker (Lambda mode) the
+     * handler of `createSqsLambdaHandler()` does.
+     */
+    recover(): Promise<boolean>;
     close(): Promise<void>;
   };
 
@@ -84,8 +97,42 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
     shutdownGraceMs: config.shutdownGraceMs,
     payloads,
   });
+  const guard = new RecoveryGuard(
+    clients.documents,
+    config.tableName,
+    config.recoveryIntervalSeconds
+  );
   let closing: Promise<void> | undefined;
   let starting: Promise<void> | undefined;
+  let recovering: Promise<boolean> | undefined;
+
+  // Recovery, as world-postgres does on start: every run that has not ended
+  // gets a message, in case the one that would continue it was lost. A
+  // duplicate costs a replay that finds nothing to do, so the eventually
+  // consistent index read (a run created a moment ago may be missing, and
+  // its own message is in SQS anyway) is fine. At most once per interval
+  // per table (`recovery.ts`).
+  const recover = () => {
+    recovering ??= (async () => {
+      const claim = await guard.claim();
+      if (!claim) {
+        debugLog('recovery skipped: the table was recovered recently', {
+          tableName: config.tableName,
+        });
+        return false;
+      }
+      try {
+        await reenqueueActiveRuns(storage.runs, queue.queue, 'world-aws');
+      } catch (error) {
+        await claim.release();
+        throw error;
+      }
+      return true;
+    })().finally(() => {
+      recovering = undefined;
+    });
+    return recovering;
+  };
 
   return {
     // Spec 9 runs only on request (`WORKFLOW_SPEC_VERSION=9`): the storage
@@ -109,19 +156,15 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
 
     streams: streamer.streams,
 
+    recover,
+
     start() {
-      // Recovery, as world-postgres does on start: every run that has not
-      // ended gets a message, in case the one that would continue it was
-      // lost. A duplicate costs a replay that finds nothing to do, so the
-      // eventually consistent index read (a run created a moment ago may be
-      // missing, and its own message is in SQS anyway) is fine.
-      //
-      // It runs before the worker starts: when it fails (a missing index, a
-      // throttled query), start() rejects with no worker running, and the
-      // next start() recovers and starts it.
+      // Recovery runs before the worker starts: when it fails (a missing
+      // index, a throttled query), start() rejects with no worker running,
+      // and the next start() recovers and starts it.
       starting ??= (async () => {
         if (!queue.canStartWorker()) return;
-        await reenqueueActiveRuns(storage.runs, queue.queue, 'world-aws');
+        await recover();
         await queue.startWorker();
       })().finally(() => {
         starting = undefined;

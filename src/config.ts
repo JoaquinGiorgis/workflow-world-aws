@@ -57,6 +57,13 @@ export interface AwsWorldConfig {
    * Env: `WORKFLOW_AWS_STREAM_POLL_INTERVAL_MS`.
    */
   streamPollIntervalMs: number;
+  /**
+   * Startup recovery (re-enqueueing the runs that have not ended) runs at
+   * most once per this many seconds per table, across processes: a
+   * process that starts within it after another one recovered skips it.
+   * 0 recovers on every start. Env: `WORKFLOW_AWS_RECOVERY_INTERVAL_SECONDS`.
+   */
+  recoveryIntervalSeconds: number;
 }
 
 export type AwsWorldOptions = Partial<AwsWorldConfig>;
@@ -77,6 +84,7 @@ export const NUMBER_ENV = {
   shutdownGraceMs: 'WORKFLOW_AWS_SHUTDOWN_GRACE_MS',
   pollWaitSeconds: 'WORKFLOW_AWS_POLL_WAIT_SECONDS',
   streamPollIntervalMs: 'WORKFLOW_AWS_STREAM_POLL_INTERVAL_MS',
+  recoveryIntervalSeconds: 'WORKFLOW_AWS_RECOVERY_INTERVAL_SECONDS',
 } as const;
 
 export const DEFAULTS = {
@@ -85,7 +93,11 @@ export const DEFAULTS = {
   shutdownGraceMs: 30_000,
   pollWaitSeconds: 20,
   streamPollIntervalMs: 250,
+  recoveryIntervalSeconds: 900,
 } as const;
+
+/** The longest recovery interval: 30 days. */
+const MAX_RECOVERY_INTERVAL_SECONDS = 30 * 24 * 3600;
 
 /** SQS caps a visibility timeout at 12 hours. */
 const MAX_VISIBILITY_TIMEOUT_SECONDS = 43_200;
@@ -207,6 +219,11 @@ export function resolveConfig(
     1,
     Number.MAX_SAFE_INTEGER
   );
+  const recoveryIntervalSeconds = number(
+    'recoveryIntervalSeconds',
+    0,
+    MAX_RECOVERY_INTERVAL_SECONDS
+  );
 
   if (problems.length > 0) {
     throw new AwsWorldConfigError(problems);
@@ -225,6 +242,7 @@ export function resolveConfig(
     shutdownGraceMs,
     pollWaitSeconds,
     streamPollIntervalMs,
+    recoveryIntervalSeconds,
   };
 }
 
