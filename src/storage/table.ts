@@ -6,6 +6,7 @@ import {
   PutCommand,
   QueryCommand,
   type QueryCommandInput,
+  type QueryCommandOutput,
   TransactWriteCommand,
   type TransactWriteCommandInput,
 } from '@aws-sdk/lib-dynamodb';
@@ -13,6 +14,7 @@ import type { TableKey } from '../keys.js';
 import {
   MAX_ITEM_BYTES,
   MAX_TRANSACTION_BYTES,
+  MissingTableIndexError,
   PayloadTooLargeError,
 } from './errors.js';
 import type { Item } from './items.js';
@@ -102,9 +104,17 @@ export class Table {
   async queryPage(
     input: QueryInput
   ): Promise<{ items: Item[]; lastKey?: Record<string, unknown> }> {
-    const result = await this.documents.send(
-      new QueryCommand({ TableName: this.name, ...input })
-    );
+    let result: QueryCommandOutput;
+    try {
+      result = await this.documents.send(
+        new QueryCommand({ TableName: this.name, ...input })
+      );
+    } catch (error) {
+      if (input.IndexName && isMissingIndex(error, input.IndexName)) {
+        throw new MissingTableIndexError(this.name, input.IndexName, error);
+      }
+      throw error;
+    }
     return { items: result.Items ?? [], lastKey: result.LastEvaluatedKey };
   }
 
@@ -151,6 +161,24 @@ export class Table {
       })
     );
   }
+}
+
+/**
+ * Whether a query failed because the table has no index `indexName`:
+ * DynamoDB answers `ValidationException` ("The table does not have the
+ * specified index"), moto and LocalStack `ResourceNotFoundException`.
+ */
+function isMissingIndex(error: unknown, indexName: string): boolean {
+  const { name, message } = (error ?? {}) as {
+    name?: string;
+    message?: string;
+  };
+  return (
+    (name === 'ValidationException' || name === 'ResourceNotFoundException') &&
+    typeof message === 'string' &&
+    /index/i.test(message) &&
+    message.includes(indexName)
+  );
 }
 
 function withTable(entry: TransactItem, tableName: string): object {

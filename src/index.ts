@@ -158,6 +158,8 @@ export {
 } from './queue/index.js';
 export {
   MAX_ITEM_BYTES,
+  MISSING_TABLE_INDEX_CODE,
+  MissingTableIndexError,
   PAYLOAD_TOO_LARGE_CODE,
   PayloadTooLargeError,
   type RetryOptions,

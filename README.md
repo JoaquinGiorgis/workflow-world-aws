@@ -116,9 +116,32 @@ Limits:
   cost grows with the length of the log.
 - The `RUNS`, `HOOKS` and `ACTIVE` index partitions take every run, hook
   and active run: at very high write rates they become hot partitions.
-- A table created before GSI3 needs the index added (`UpdateTable`) and
-  its active runs' items given `GSI3PK = ACTIVE` and `GSI3SK = <runId>`;
-  until then startup recovery does not see them.
+- A table created before GSI3 needs the index added; see
+  [Upgrading a table](#upgrading-a-table). Until then `start()` and
+  `runs.list` by status fail with `MissingTableIndexError`
+  (`code: 'MISSING_TABLE_INDEX'`), which names the index and the fix.
+
+### Upgrading a table
+
+A table created by an older bootstrap has GSI1 and GSI2 but not GSI3 (the
+runs that have not ended). Against an emulator, run
+`pnpm bootstrap:local` again: it adds GSI3 to the existing table, waits for
+it and backfills the runs. On AWS, add the index once:
+
+```bash
+aws dynamodb update-table --table-name <table> \
+  --attribute-definitions AttributeName=GSI3PK,AttributeType=S AttributeName=GSI3SK,AttributeType=S \
+  --global-secondary-index-updates \
+  '[{"Create":{"IndexName":"GSI3","KeySchema":[{"AttributeName":"GSI3PK","KeyType":"HASH"},{"AttributeName":"GSI3SK","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}]}'
+```
+
+and, once it is `ACTIVE`, backfill it as a one-off step: every run item
+(`SK = META`) whose `status` is not `completed`, `failed` or `cancelled`
+gets `GSI3PK = ACTIVE` and `GSI3SK = <runId>`. Runs created afterwards
+carry the attributes from their creation. `backfillActiveRunIndex(clients,
+tableName)` in `scripts/bootstrap-local.ts` does exactly that (a scan and a
+conditional update per run, safe to run again) with whatever clients you
+pass it.
 
 ## Queue
 

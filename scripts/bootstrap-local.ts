@@ -10,10 +10,17 @@
  * It refuses to run without WORKFLOW_AWS_ENDPOINT so that it never creates
  * resources in a real AWS account by accident.
  */
+import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import {
+  type AttributeValue,
+  ConditionalCheckFailedException,
   CreateTableCommand,
+  DescribeTableCommand,
   ResourceInUseException,
+  ScanCommand,
+  UpdateItemCommand,
+  UpdateTableCommand,
   UpdateTimeToLiveCommand,
   waitUntilTableExists,
 } from '@aws-sdk/client-dynamodb';
@@ -28,12 +35,19 @@ import {
   GetQueueAttributesCommand,
   type SQSClient,
 } from '@aws-sdk/client-sqs';
+import { TERMINAL_WORKFLOW_RUN_STATUSES } from '@workflow/world';
 import {
   type AwsClients,
   createClients,
   destroyClients,
 } from '../src/clients.js';
-import { GSI1_NAME, GSI2_NAME, GSI3_NAME } from '../src/keys.js';
+import {
+  ACTIVE_RUNS_GSI3PK,
+  GSI1_NAME,
+  GSI2_NAME,
+  GSI3_NAME,
+  RUN_META_SK,
+} from '../src/keys.js';
 import { DEFAULT_MAX_RECEIVE_COUNT } from '../src/queue/index.js';
 
 /** SQS's longest retention, 14 days, for both queues and dead letters. */
@@ -110,11 +124,15 @@ export async function bootstrapLocal(
   }
 }
 
+/** How long the bootstrap waits for a new GSI to become ACTIVE. */
+const INDEX_WAIT_MS = 5 * 60_000;
+
 /**
  * Creates the World's table: PK/SK, GSI1 (every run and every hook, by id),
  * GSI2 (runs per workflow name) and the sparse GSI3 (runs that have not
  * ended), on-demand billing, and TTL on {@link TTL_ATTRIBUTE}. Keeps a table
- * that already exists.
+ * that already exists, adding GSI3 to one created before it
+ * ({@link addActiveRunIndex}).
  */
 export async function createWorkflowTable(
   clients: AwsClients,
@@ -175,6 +193,7 @@ export async function createWorkflowTable(
     { client: clients.dynamodb, maxWaitTime: 60, minDelay: 1, maxDelay: 2 },
     { TableName: tableName }
   );
+  await addActiveRunIndex(clients, tableName);
 
   try {
     await clients.dynamodb.send(
@@ -190,6 +209,119 @@ export async function createWorkflowTable(
     // DynamoDB refuses to enable TTL twice; that is the state we want.
     if (!/already enabled/i.test((error as Error).message ?? '')) throw error;
   }
+}
+
+/**
+ * Adds GSI3 (the runs that have not ended) to a table created without it,
+ * by an older bootstrap: `UpdateTable`, a wait until the index is ACTIVE,
+ * and {@link backfillActiveRunIndex}. Does nothing when the index exists.
+ *
+ * @returns whether it added the index.
+ */
+export async function addActiveRunIndex(
+  clients: AwsClients,
+  tableName: string
+): Promise<boolean> {
+  const indexStatus = async () => {
+    const { Table } = await clients.dynamodb.send(
+      new DescribeTableCommand({ TableName: tableName })
+    );
+    return Table?.GlobalSecondaryIndexes?.find(
+      (index) => index.IndexName === GSI3_NAME
+    )?.IndexStatus;
+  };
+  if ((await indexStatus()) !== undefined) return false;
+
+  await clients.dynamodb.send(
+    new UpdateTableCommand({
+      TableName: tableName,
+      AttributeDefinitions: [
+        { AttributeName: 'GSI3PK', AttributeType: 'S' },
+        { AttributeName: 'GSI3SK', AttributeType: 'S' },
+      ],
+      GlobalSecondaryIndexUpdates: [
+        {
+          Create: {
+            IndexName: GSI3_NAME,
+            KeySchema: [
+              { AttributeName: 'GSI3PK', KeyType: 'HASH' },
+              { AttributeName: 'GSI3SK', KeyType: 'RANGE' },
+            ],
+            Projection: { ProjectionType: 'ALL' },
+          },
+        },
+      ],
+    })
+  );
+  const deadline = Date.now() + INDEX_WAIT_MS;
+  while ((await indexStatus()) !== 'ACTIVE') {
+    if (Date.now() > deadline) {
+      throw new Error(
+        `${GSI3_NAME} of table "${tableName}" did not become ACTIVE within ${INDEX_WAIT_MS / 1000} s`
+      );
+    }
+    await sleep(1_000);
+  }
+  await backfillActiveRunIndex(clients, tableName);
+  return true;
+}
+
+/**
+ * Puts every run that has not ended in GSI3: the one-off step after adding
+ * the index to a table that already holds runs (new runs carry the
+ * attributes from their creation). A run that ends meanwhile, or got the
+ * attributes some other way, is left alone. Safe to run more than once.
+ *
+ * @returns how many runs it added to the index.
+ */
+export async function backfillActiveRunIndex(
+  clients: AwsClients,
+  tableName: string
+): Promise<number> {
+  const terminal: Record<string, AttributeValue> = {};
+  TERMINAL_WORKFLOW_RUN_STATUSES.forEach((status, i) => {
+    terminal[`:t${i}`] = { S: status };
+  });
+  const notEnded = `attribute_not_exists(GSI3PK) AND NOT (#status IN (${Object.keys(terminal).join(', ')}))`;
+  let added = 0;
+  let startKey: Record<string, AttributeValue> | undefined;
+  do {
+    const page = await clients.dynamodb.send(
+      new ScanCommand({
+        TableName: tableName,
+        FilterExpression: `SK = :meta AND ${notEnded}`,
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':meta': { S: RUN_META_SK }, ...terminal },
+        ProjectionExpression: 'PK, SK, runId',
+        ...(startKey && { ExclusiveStartKey: startKey }),
+      })
+    );
+    for (const item of page.Items ?? []) {
+      const runId = item.runId?.S;
+      if (!item.PK || !item.SK || !runId) continue;
+      try {
+        await clients.dynamodb.send(
+          new UpdateItemCommand({
+            TableName: tableName,
+            Key: { PK: item.PK, SK: item.SK },
+            UpdateExpression: 'SET GSI3PK = :pk, GSI3SK = :runId',
+            ConditionExpression: `attribute_exists(PK) AND ${notEnded}`,
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+              ':pk': { S: ACTIVE_RUNS_GSI3PK },
+              ':runId': { S: runId },
+              ...terminal,
+            },
+          })
+        );
+        added++;
+      } catch (error) {
+        if (!(error instanceof ConditionalCheckFailedException)) throw error;
+      }
+    }
+    startKey = page.LastEvaluatedKey;
+  } while (startKey);
+  return added;
 }
 
 /**
