@@ -225,12 +225,23 @@ export async function decideHookCreated(
       createdAt: now,
       claimedFrom,
     }) as Item;
-  const newHookWrites = (hook: Item): TaggedItem[] => [
+  /**
+   * The new hook and its id pointer. `pointerOwner`: the run the pointer
+   * names now, re-pointed with one conditional put (a transaction may not
+   * delete and put one item).
+   */
+  const newHookWrites = (hook: Item, pointerOwner?: string): TaggedItem[] => [
     {
       item: {
         Put: {
           Item: toStorable({ ...hookIdKey(hookId), runId, token }) as Item,
-          ConditionExpression: 'attribute_not_exists(PK)',
+          ...(pointerOwner === undefined
+            ? { ConditionExpression: 'attribute_not_exists(PK)' }
+            : {
+                ConditionExpression: '#runId = :runId',
+                ExpressionAttributeNames: { '#runId': 'runId' },
+                ExpressionAttributeValues: { ':runId': pointerOwner },
+              }),
         },
       },
     },
@@ -279,7 +290,7 @@ function takeOver(
   own: Own,
   answer: Answer,
   hookFor: (claimedFrom?: Hook['claimedFrom']) => Item,
-  newHookWrites: (hook: Item) => TaggedItem[]
+  newHookWrites: (hook: Item, pointerOwner?: string) => TaggedItem[]
 ): Decision<Outcome> {
   const { token } = data.eventData;
   const victimRun = victim.run;
@@ -339,8 +350,14 @@ function takeOver(
   const writes: TaggedItem[] = [
     ...claimToken(token, { runId, hookId }, victim, true),
     { item: { Delete: { Key: hookKey(victim.runId, victim.hookId) } } },
-    { item: pointerDelete(victim.runId, victim.hookId) },
-    ...newHookWrites(hook),
+    // The victim's hook id may be the claimer's own: then its pointer is
+    // re-pointed instead of deleted.
+    ...(victim.hookId === hookId
+      ? newHookWrites(hook, victim.runId)
+      : [
+          { item: pointerDelete(victim.runId, victim.hookId) },
+          ...newHookWrites(hook),
+        ]),
   ];
 
   if (victim.runId === runId) {
