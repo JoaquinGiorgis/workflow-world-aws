@@ -11,6 +11,7 @@ import type { SqsBatchResponse, SqsLambdaEvent } from './queue/lambda.js';
 import { RecoveryGuard } from './recovery.js';
 import {
   createStorage,
+  MISSING_TABLE_INDEX_CODE,
   type RetryOptions,
   STORAGE_CAPABILITIES,
 } from './storage/index.js';
@@ -243,10 +244,22 @@ export function createSqsLambdaHandler(
       await target.recover();
       recovered = true;
     } catch (error) {
-      console.warn(
-        '[world-aws] Could not recover the runs that have not ended; trying again on the next event',
-        { error: error instanceof Error ? error.message : String(error) }
-      );
+      const detail = {
+        error: error instanceof Error ? error.message : String(error),
+      };
+      if (isPermanentFailure(error)) {
+        // Every event would fail the same way; a new process tries again.
+        recovered = true;
+        console.warn(
+          '[world-aws] Could not recover the runs that have not ended; not trying again in this process',
+          detail
+        );
+      } else {
+        console.warn(
+          '[world-aws] Could not recover the runs that have not ended; trying again on the next event',
+          detail
+        );
+      }
     }
   };
 
@@ -265,6 +278,42 @@ export function createSqsLambdaHandler(
     await recovery;
     return response;
   };
+}
+
+const THROTTLING_ERRORS = new Set([
+  'ThrottlingException',
+  'ProvisionedThroughputExceededException',
+  'RequestLimitExceeded',
+  'TooManyRequestsException',
+  'SlowDown',
+]);
+
+/**
+ * Whether a failed recovery would fail again on the next event: a missing
+ * index, or an AWS client error (access denied, a validation error) that
+ * is not throttling.
+ */
+function isPermanentFailure(error: unknown): boolean {
+  const { code, name, $fault, $metadata, $retryable } = (error ?? {}) as {
+    code?: unknown;
+    name?: unknown;
+    $fault?: unknown;
+    $metadata?: { httpStatusCode?: number };
+    $retryable?: { throttling?: boolean };
+  };
+  if (code === MISSING_TABLE_INDEX_CODE) return true;
+  const status = $metadata?.httpStatusCode;
+  if (
+    $retryable?.throttling ||
+    (typeof name === 'string' && THROTTLING_ERRORS.has(name)) ||
+    status === 429
+  ) {
+    return false;
+  }
+  return (
+    $fault === 'client' ||
+    (status !== undefined && status >= 400 && status < 500)
+  );
 }
 
 export { type AwsClients, createClients, destroyClients } from './clients.js';
