@@ -109,6 +109,13 @@ export type SqsQueue = Queue &
      * and no worker runs over these queues in this process.
      */
     canStartWorker(): boolean;
+    /**
+     * Resolves once the idempotency keys of earlier sends are marked sent.
+     * `queue()` answers before that write lands; a process about to be
+     * frozen (a Lambda function answering its event) waits here first.
+     * `close()` waits too.
+     */
+    settled(): Promise<void>;
     start(): Promise<void>;
     close(): Promise<void>;
   };
@@ -145,6 +152,26 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
   let consumer: Consumer | undefined;
   let closed = false;
   let closing: Promise<void> | undefined;
+  /** Confirmations of idempotency keys still in flight. */
+  const confirming = new Set<Promise<void>>();
+
+  /**
+   * Marks a key's message sent without holding up the send: the message is
+   * in SQS already, and a confirmation that never lands only lets the key
+   * be taken over after `RESERVATION_TIMEOUT_MS`. `confirm` logs and
+   * swallows its own errors.
+   */
+  const confirmLater = (key: string, messageId: MessageId, at: number) => {
+    const pending: Promise<void> = idempotency
+      .confirm(key, messageId, at)
+      .finally(() => confirming.delete(pending));
+    confirming.add(pending);
+  };
+
+  /** Resolves once no confirmation is in flight. */
+  const settled = async () => {
+    while (confirming.size > 0) await Promise.allSettled([...confirming]);
+  };
 
   const queueUrlFor = (payload: unknown) =>
     isStepMessage(payload) ? stepQueueUrl : workflowQueueUrl;
@@ -201,9 +228,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
       }
       throw error;
     }
-    if (reserved) {
-      await idempotency.confirm(reserved.key, messageId, reserved.at);
-    }
+    if (reserved) confirmLater(reserved.key, messageId, reserved.at);
     return { messageId };
   };
 
@@ -308,7 +333,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
           if (!each) continue;
           results[each.index] = { messageId: each.message.messageId };
           if (each.reserved) {
-            await idempotency.confirm(
+            confirmLater(
               each.reserved.key,
               each.message.messageId,
               each.reserved.at
@@ -421,6 +446,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
     async start() {
       await startWorker();
     },
+    settled,
     close() {
       closed = true;
       closing ??= (async () => {
@@ -428,6 +454,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
           await consumer.close();
           if (shared.consumer === consumer) delete shared.consumer;
         }
+        await settled();
         destroyNodeHttpAgents(agents);
       })();
       return closing;
