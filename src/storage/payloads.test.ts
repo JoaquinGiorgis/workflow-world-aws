@@ -593,8 +593,19 @@ describe('PayloadStore', () => {
     expect(key(`RUN#${runId}`, 'SNAPSHOT', 'data')).toBe(
       `${runId}/snapshot/${runId}/data`
     );
-    expect(key(`STREAM#${runId}#my/out`, 'CHUNK#0000000003', 'data')).toBe(
-      `${runId}/stream/${encodeURIComponent('my/out/CHUNK#0000000003')}/data`
-    );
+  });
+
+  it('lays stream chunk keys out by stream name and position', () => {
+    // One segment per stream (its name, encoded: names may hold "/"), then
+    // one per chunk, so a listing or a lifecycle rule can take one stream.
+    expect(
+      objectKeyPrefix(
+        { PK: `STREAM#${runId}#my/out`, SK: 'CHUNK#0000000003' },
+        'data'
+      )
+    ).toBe(`${runId}/stream/my%2Fout/0000000003/data`);
+    expect(
+      objectKeyPrefix({ PK: `STREAM#${runId}#out`, SK: 'CLOSED' }, 'data')
+    ).toBe(`${runId}/stream/out/CLOSED/data`);
   });
 });

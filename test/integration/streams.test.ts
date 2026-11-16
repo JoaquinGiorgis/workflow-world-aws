@@ -1337,7 +1337,8 @@ describe('chunks too large for an item', () => {
     const page = await streamer.streams.getChunks(TEST_RUN_ID, streamName);
     expect(page.data[1]?.data).toEqual(large);
 
-    // The item holds a reference to an object under the run's prefix.
+    // The item holds a reference to an object under the stream's prefix,
+    // one segment per chunk position.
     const { Item } = await ctx.clients.documents.send(
       new GetCommand({
         TableName: ctx.tableName,
@@ -1346,7 +1347,9 @@ describe('chunks too large for an item', () => {
     );
     const ref = Item?.data as { s3Ref: string };
     expect(ref.s3Ref).toMatch(
-      new RegExp(`^s3://${aws.bucket}/${TEST_RUN_ID}/stream/`)
+      new RegExp(
+        `^s3://${aws.bucket}/${TEST_RUN_ID}/stream/${encodeURIComponent(streamName)}/0000000001/data-`
+      )
     );
     const { bucket, key } = s3Location(ref.s3Ref);
     await expect(
