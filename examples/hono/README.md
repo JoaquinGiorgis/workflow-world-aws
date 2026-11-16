@@ -91,9 +91,17 @@ output.
   days (bodies of messages that never got delivered);
 - `ApiFunction` behind a function URL with `AWS_IAM` auth, and
   `QueueFunction` behind both queues with `ReportBatchItemFailures`;
-- one managed policy, the World's ([`docs/iam-policy.json`](../../docs/iam-policy.json)),
-  for both functions. SAM adds the SQS permissions the event source
-  mappings need.
+- `RecoverFunction`, which calls `world.recover()` every 15 minutes (the
+  `RecoverySchedule` parameter; leave it empty to drop the function).
+  `QueueFunction` recovers runs only on the first event of each process,
+  so without it a run whose next message was lost would wait for the next
+  message to arrive while the queues are idle;
+- two managed policies: `WorldPolicy`, the World's
+  ([`docs/iam-policy.json`](../../docs/iam-policy.json)), for
+  `QueueFunction`, and `SenderPolicy`, the same without
+  `sqs:ReceiveMessage`, `sqs:DeleteMessage` and
+  `sqs:ChangeMessageVisibility`, for the two functions that only send.
+  SAM adds the SQS permissions the event source mappings need.
 
 ```bash
 pnpm install && pnpm build
@@ -111,7 +119,22 @@ of `ApiFunction`, or switch the URL to `AuthType: NONE` and add auth to
 the Hono app. The flow route (`/.well-known/workflow/v1/flow`) is not
 served by the API: deliveries reach the runtime in process only.
 
+The function URL buffers responses (its default invoke mode), so on AWS
+`GET /runs/:runId/stream` answers with the whole greeting once the stream
+closes, not word by word. Streaming it would take `InvokeMode:
+RESPONSE_STREAM` on the URL and Hono's `streamHandle` instead of `handle`
+in `src/lambda.ts`; that has not been tried.
+
+`sam delete` deletes the table, and with it every run, and the bucket
+(CloudFormation deletes a bucket only once it is empty). The template sets
+no `DeletionPolicy: Retain`; add it to `WorkflowTable` and `PayloadBucket`
+before keeping data you need.
+
 What was checked without an AWS account: `pnpm test:template` reads the
-template and checks the table, queues, mappings, policy and lifecycle; an
-esbuild bundle of `src/lambda.ts` with the template's settings loads and
-exports `api` and `queue`. The template has not been deployed.
+template and checks the table, queues, mappings, policies, recovery
+schedule and lifecycle; an esbuild bundle of `src/lambda.ts` with the
+template's settings loads and exports `api` and `queue`. The template has
+not been deployed, and has not gone through `sam build`: the esbuild
+`Banner` that gives the ESM bundle a `require` is unverified there. If the
+built functions fail at import with `require is not defined`, switch the
+`BuildProperties` to `Format: cjs` (without `OutExtension`).
