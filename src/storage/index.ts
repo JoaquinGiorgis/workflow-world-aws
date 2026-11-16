@@ -1,0 +1,51 @@
+import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import type { Storage, WorldCapabilities } from '@workflow/world';
+import { DEFAULT_RETRY, type RetryOptions } from './commit.js';
+import type { StorageContext } from './context.js';
+import { createEventsStorage } from './events.js';
+import { createHooksStorage } from './hooks.js';
+import { createRunsStorage } from './runs.js';
+import { createSnapshotsStorage } from './snapshots.js';
+import { createStepsStorage } from './steps.js';
+import { Table } from './table.js';
+
+export interface StorageOptions {
+  documents: DynamoDBDocumentClient;
+  tableName: string;
+  /** Retries of a write that loses a race; see `commit.ts`. */
+  retry?: Partial<RetryOptions>;
+}
+
+/**
+ * What the storage implements, in `WorldCapabilities` terms. Queue
+ * capabilities (`maxConcurrency`, `invoke`) belong to the queue.
+ */
+export const STORAGE_CAPABILITIES = {
+  hookRetention: { active: true },
+  atomicStartHook: { active: true },
+  dynamicWorkflowCode: true,
+  hookResumeDedup: true,
+  hookForceClaim: true,
+  inBandFence: true,
+} as const satisfies WorldCapabilities;
+
+/** The World's storage over one DynamoDB table. */
+export function createStorage(options: StorageOptions): Storage {
+  const context: StorageContext = {
+    table: new Table(options.documents, options.tableName),
+    retry: { ...DEFAULT_RETRY, ...options.retry },
+  };
+  return {
+    runs: createRunsStorage(context.table, context.retry),
+    steps: createStepsStorage(context.table),
+    events: createEventsStorage(context),
+    hooks: createHooksStorage(context.table),
+    experimental_snapshots: createSnapshotsStorage(context.table),
+  };
+}
+
+export {
+  MAX_ITEM_BYTES,
+  PAYLOAD_TOO_LARGE_CODE,
+  PayloadTooLargeError,
+} from './errors.js';
