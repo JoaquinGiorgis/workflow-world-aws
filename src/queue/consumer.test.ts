@@ -494,6 +494,46 @@ describe('the worker', () => {
     expect(most).toBeGreaterThan(1);
   });
 
+  it("does not let a spec 9 run's waiting deliveries hold the queue's slots", async () => {
+    const releases = new Map<string, () => void>();
+    const started: string[] = [];
+    let running = 0;
+    let most = 0;
+    const handler = vi.fn(async (payload: unknown) => {
+      const { runId } = payload as { runId: string };
+      started.push(runId);
+      running++;
+      most = Math.max(most, running);
+      await new Promise<void>((resolve) => {
+        if (runId === 'wrun_A' && !releases.has('first')) {
+          releases.set('first', resolve);
+        } else {
+          setTimeout(resolve, 10);
+        }
+      });
+      running--;
+    });
+    const { queue, options } = await worker(handler, { concurrency: 2 });
+    // While the first delivery of run A runs, two more of run A wait for
+    // it; run B's message must still get a slot.
+    serveMessages(mocks, options.workflowQueueUrl, [
+      sqsMessage({ payload: { runId: 'wrun_A', runSpecVersion: 9 } }),
+      sqsMessage({ payload: { runId: 'wrun_A', runSpecVersion: 9 } }),
+      sqsMessage({ payload: { runId: 'wrun_A', runSpecVersion: 9 } }),
+      sqsMessage({ payload: { runId: 'wrun_B', runSpecVersion: 9 } }),
+      sqsMessage({ payload: { runId: 'wrun_C' } }),
+    ]);
+    await queue.startWorker();
+
+    await vi.waitFor(() =>
+      expect(started).toEqual(['wrun_A', 'wrun_B', 'wrun_C'])
+    );
+    releases.get('first')?.();
+    await vi.waitFor(() => expect(deleted()).toHaveLength(5));
+    expect(started.filter((runId) => runId === 'wrun_A')).toHaveLength(3);
+    expect(most).toBeLessThanOrEqual(2);
+  });
+
   it('runs at most `concurrency` messages of a queue at once', async () => {
     let running = 0;
     let most = 0;
@@ -732,6 +772,51 @@ describe('close()', () => {
         .filter((entry) => entry.startsWith(`${second.ReceiptHandle} `))
         .slice(givenBack)
     ).toEqual([`${second.ReceiptHandle} 0`, `${second.ReceiptHandle} 0 end`]);
+  });
+
+  it('gives a message waiting at its run gate back at once, even if the delivery ahead outlives the grace period', async () => {
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const handler = vi.fn(async () => {
+      started();
+      await new Promise<void>((resolve) => (finish = resolve));
+    });
+    const { queue, options } = await worker(handler, {
+      shutdownGraceMs: 50,
+      internal: { log: () => {}, heartbeatIntervalMs: 10 },
+    });
+    const first = sqsMessage({
+      payload: { runId: 'wrun_A', runSpecVersion: 9 },
+    });
+    const second = sqsMessage({
+      payload: { runId: 'wrun_A', runSpecVersion: 9 },
+    });
+    serveMessages(mocks, options.workflowQueueUrl, [first, second]);
+    await queue.startWorker();
+    await running;
+    // The second is received (its heartbeat runs) and waits for the first.
+    await vi.waitFor(() =>
+      expect(visibilityChanges()).toContainEqual(
+        expect.objectContaining({ ReceiptHandle: second.ReceiptHandle })
+      )
+    );
+
+    await queue.close();
+
+    // The first delivery is abandoned; the second, which never started,
+    // is visible again right away rather than after its visibility timeout.
+    expect(visibilityChanges()).toContainEqual(
+      expect.objectContaining({
+        ReceiptHandle: second.ReceiptHandle,
+        VisibilityTimeout: 0,
+      })
+    );
+    expect(handler).toHaveBeenCalledTimes(1);
+    finish();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(deleted()).toEqual([]);
   });
 
   it('is idempotent and leaves a closed queue stopped', async () => {
