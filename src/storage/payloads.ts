@@ -196,7 +196,7 @@ export class PayloadStore {
    * Writes `value` under `keyPrefix` and returns its reference.
    *
    * @throws when no bucket is configured, and {@link PayloadBucketError}
-   *   when the configured one does not exist.
+   *   when the configured one does not exist or is in another region.
    */
   async put(
     keyPrefix: string,
@@ -226,8 +226,12 @@ export class PayloadStore {
           })
         );
       } catch (error) {
-        if ((error as { name?: string } | undefined)?.name === 'NoSuchBucket') {
+        const name = (error as { name?: string } | undefined)?.name;
+        if (name === 'NoSuchBucket') {
           throw new PayloadBucketError(bucket, error);
+        }
+        if (name === 'PermanentRedirect') {
+          throw new PayloadBucketError(bucket, error, true);
         }
         throw error;
       }

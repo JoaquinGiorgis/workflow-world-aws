@@ -603,7 +603,9 @@ created without GSI3. See [Upgrading a table](#upgrading-a-table-without-gsi3).
 DynamoDB or SQS and no bucket is configured. Set `WORKFLOW_AWS_BUCKET`.
 
 **`PayloadBucketError` (`PAYLOAD_BUCKET_NOT_FOUND`).** The configured bucket
-does not exist in the region, or the name is wrong.
+does not exist (the name is wrong), or it is in another region than
+`WORKFLOW_AWS_REGION` (S3 answered `PermanentRedirect`); the message says
+which.
 
 **`AccessDeniedException` / `AccessDenied`.** The role misses an action of
 the [IAM policy](#iam), often `dynamodb:Query` on `table/<table>/index/*`

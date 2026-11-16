@@ -27,14 +27,17 @@ export const PAYLOAD_BUCKET_NOT_FOUND_CODE = 'PAYLOAD_BUCKET_NOT_FOUND';
 
 /**
  * The S3 bucket the World is configured to store large payloads in does
- * not exist. Nothing is written.
+ * not exist, or is in another region than the World's (S3 answers
+ * `PermanentRedirect`). Nothing is written.
  */
 export class PayloadBucketError extends WorkflowWorldError {
   readonly bucket: string;
 
-  constructor(bucket: string, cause: unknown) {
+  constructor(bucket: string, cause: unknown, otherRegion = false) {
     super(
-      `The S3 bucket "${bucket}" does not exist. The AWS World stores payloads too large for DynamoDB or SQS there; it is set with the \`bucket\` option of createWorld() or the WORKFLOW_AWS_BUCKET environment variable. Create the bucket, or point the setting at one that exists.`,
+      otherRegion
+        ? `The S3 bucket "${bucket}" is in another region than the AWS World (WORKFLOW_AWS_REGION, or the \`region\` option). The World stores payloads too large for DynamoDB or SQS there; it is set with the \`bucket\` option of createWorld() or the WORKFLOW_AWS_BUCKET environment variable. Use a bucket in the World's region.`
+        : `The S3 bucket "${bucket}" does not exist. The AWS World stores payloads too large for DynamoDB or SQS there; it is set with the \`bucket\` option of createWorld() or the WORKFLOW_AWS_BUCKET environment variable. Create the bucket, or point the setting at one that exists.`,
       { status: 500, code: PAYLOAD_BUCKET_NOT_FOUND_CODE, cause }
     );
     this.name = 'PayloadBucketError';

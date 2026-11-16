@@ -528,6 +528,35 @@ describe('S3 offload of payloads too large for an item', () => {
     await expect(write).rejects.toThrow(/WORKFLOW_AWS_BUCKET/);
     expect(transactions()).toHaveLength(0);
   });
+
+  it('says so when the bucket is in another region', async () => {
+    serve({ [`RUN#${runId}|META`]: runItem() });
+    s3Mock
+      .on(PutObjectCommand)
+      .rejects(
+        Object.assign(
+          new Error(
+            'The bucket you are attempting to access must be addressed using the specified endpoint.'
+          ),
+          { name: 'PermanentRedirect', $metadata: { httpStatusCode: 301 } }
+        )
+      );
+    const storage = createStorage({
+      documents,
+      tableName: 'wf',
+      payloads: new PayloadStore({ s3, bucket: 'elsewhere' }),
+    });
+
+    const write = storage.events.create(runId, stepCreated(bytes(400 * 1024)));
+    await expect(write).rejects.toMatchObject({
+      name: 'PayloadBucketError',
+      code: 'PAYLOAD_BUCKET_NOT_FOUND',
+      bucket: 'elsewhere',
+    });
+    await expect(write).rejects.toThrow(/"elsewhere" is in another region/);
+    await expect(write).rejects.toThrow(/WORKFLOW_AWS_REGION/);
+    expect(transactions()).toHaveLength(0);
+  });
 });
 
 describe('PayloadStore', () => {
