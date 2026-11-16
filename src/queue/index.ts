@@ -93,6 +93,11 @@ export type SqsQueue = Queue &
      * queues in this process) or the queue is closed.
      */
     startWorker(): Promise<boolean>;
+    /**
+     * Whether `startWorker()` would start the worker now: the queue is open
+     * and no worker runs over these queues in this process.
+     */
+    canStartWorker(): boolean;
     start(): Promise<void>;
     close(): Promise<void>;
   };
@@ -336,9 +341,10 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
     return results;
   };
 
+  const canStartWorker = () => !closed && !consumer && !shared.consumer;
+
   const startWorker = async (): Promise<boolean> => {
-    if (closed || consumer) return false;
-    if (shared.consumer) return false;
+    if (!canStartWorker()) return false;
     consumer = new Consumer({
       sqs,
       queueUrls: [workflowQueueUrl, stepQueueUrl],
@@ -380,6 +386,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
       shared.routes.set(QueuePrefix.parse(prefix), parseQueueRoute(path));
     },
     startWorker,
+    canStartWorker,
     async start() {
       await startWorker();
     },

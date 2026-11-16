@@ -195,10 +195,12 @@ not supported: they have no per-message delay.
   again after their visibility timeout) and releases the clients. It is
   idempotent. One worker runs per process for a set of queues, even if
   several World instances call `start()`.
-- **Recovery.** When `start()` starts the worker, every run that has not
+- **Recovery.** Before `start()` starts the worker, every run that has not
   ended gets a message (`reenqueueActiveRuns`), as in world-postgres. A
   duplicate only costs a replay, and a run created a moment before (which
   the eventually consistent index may miss) has its own message in SQS.
+  If recovery fails, `start()` rejects without starting the worker, and the
+  next `start()` tries both again.
 - **Authentication.** `queueAuthMode` is `'skip'`, as in world-postgres:
   the runtime does not check requests to the flow route. IAM decides who
   can send to the queues, but anyone who can reach the route can post a

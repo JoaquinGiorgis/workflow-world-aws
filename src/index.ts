@@ -61,8 +61,8 @@ export type AwsWorld = World &
  *
  * Storage (runs, steps, events, hooks, VM snapshots) lives in one DynamoDB
  * table, and the queue on two SQS standard queues (workflow and step).
- * `start()` runs the queue worker in this process and re-enqueues the runs
- * that have not ended. Streams (M3) are not implemented yet and throw
+ * `start()` re-enqueues the runs that have not ended and runs the queue
+ * worker in this process. Streams (M3) are not implemented yet and throw
  * {@link NotImplementedError}.
  *
  * @param options - Explicit settings; anything left out is read from the
@@ -90,6 +90,7 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
     shutdownGraceMs: config.shutdownGraceMs,
   });
   let closing: Promise<void> | undefined;
+  let starting: Promise<void> | undefined;
 
   return {
     // Spec 9 runs only on request (`WORKFLOW_SPEC_VERSION=9`): the storage
@@ -120,15 +121,24 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
       getInfo: notImplemented('streams.getInfo', 'M3'),
     },
 
-    async start() {
+    start() {
       // Recovery, as world-postgres does on start: every run that has not
       // ended gets a message, in case the one that would continue it was
       // lost. A duplicate costs a replay that finds nothing to do, so the
       // eventually consistent index read (a run created a moment ago may be
       // missing, and its own message is in SQS anyway) is fine.
-      if (await queue.startWorker()) {
+      //
+      // It runs before the worker starts: when it fails (a missing index, a
+      // throttled query), start() rejects with no worker running, and the
+      // next start() recovers and starts it.
+      starting ??= (async () => {
+        if (!queue.canStartWorker()) return;
         await reenqueueActiveRuns(storage.runs, queue.queue, 'world-aws');
-      }
+        await queue.startWorker();
+      })().finally(() => {
+        starting = undefined;
+      });
+      return starting;
     },
 
     close() {
