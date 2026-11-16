@@ -182,9 +182,12 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
     },
 
     close() {
-      // The queue first: deliveries still running in its grace period may
-      // read streams. The streams last, so no reader outlives the clients.
+      // A start() or recover() in progress first, so its queries and sends
+      // do not fail on destroyed clients. Then the queue: deliveries still
+      // running in its grace period may read streams. The streams last, so
+      // no reader outlives the clients.
       closing ??= (async () => {
+        await Promise.allSettled([starting, recovering].filter(Boolean));
         await queue.close();
         await streamer.close();
         if (!options.clients) destroyClients(clients);

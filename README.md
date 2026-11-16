@@ -174,10 +174,11 @@ process with the World can start runs.
 [Recovery](#queue)) and starts a worker in the process. Per queue, it runs
 `ceil(concurrency / 10)` long-polling `ReceiveMessage` loops sharing
 `concurrency` slots. A heartbeat (`ChangeMessageVisibility`) keeps each
-message invisible while it runs. `world.close()` stops receiving, gives
-back the messages it has not started, waits up to `shutdownGraceMs` for
-running deliveries, and abandons the rest (SQS delivers them again after
-their visibility timeout). One worker runs per process for a set of
+message invisible while it runs. `world.close()` waits for a `start()` or
+`recover()` in progress, stops receiving, gives back the messages it has
+not started, waits up to `shutdownGraceMs` for running deliveries, and
+abandons the rest (SQS delivers them again after their visibility
+timeout). One worker runs per process for a set of
 queues, even if several World instances call `start()`.
 
 Use it on a long-running server: a container, ECS, EC2, a VM.

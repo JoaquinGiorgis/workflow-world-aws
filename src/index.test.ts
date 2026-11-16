@@ -1,5 +1,6 @@
 import {
   ConditionalCheckFailedException,
+  DynamoDBClient,
   TransactionCanceledException,
 } from '@aws-sdk/client-dynamodb';
 import {
@@ -7,9 +8,11 @@ import {
   DeleteMessageCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
+  SQSClient,
 } from '@aws-sdk/client-sqs';
 import {
   DeleteCommand,
+  DynamoDBDocumentClient,
   GetCommand,
   PutCommand,
   QueryCommand,
@@ -513,6 +516,53 @@ describe('createWorld', () => {
       destroyClients(clients);
     }
   });
+
+  it.each(['start', 'recover'] as const)(
+    'waits for a %s() in progress before destroying its clients',
+    async (method) => {
+      const ddb = mockClient(DynamoDBDocumentClient);
+      const sqs = mockClient(SQSClient);
+      let answer!: () => void;
+      ddb.on(PutCommand).resolves({});
+      ddb.on(QueryCommand).callsFake(
+        () =>
+          new Promise((resolve) => {
+            answer = () => resolve({ Items: [] });
+          })
+      );
+      sqs.on(ReceiveMessageCommand).callsFake(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return {};
+      });
+      const destroy = vi.spyOn(DynamoDBClient.prototype, 'destroy');
+      const world = createWorld({
+        ...options,
+        workflowQueueUrl: `${options.workflowQueueUrl}-close-${method}`,
+        pollWaitSeconds: 0,
+      });
+      try {
+        const pending = world[method]();
+        await vi.waitFor(() =>
+          expect(ddb.commandCalls(QueryCommand)).toHaveLength(1)
+        );
+        let closed = false;
+        const closing = world.close().then(() => {
+          closed = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(closed).toBe(false);
+        expect(destroy).not.toHaveBeenCalled();
+        answer();
+        await pending;
+        await closing;
+        expect(destroy).toHaveBeenCalled();
+      } finally {
+        destroy.mockRestore();
+        ddb.restore();
+        sqs.restore();
+      }
+    }
+  );
 
   it('closes once', async () => {
     const world = createWorld(options);
