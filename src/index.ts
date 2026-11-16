@@ -1,6 +1,12 @@
-import { mintedSpecVersion, type World } from '@workflow/world';
+import {
+  mintedSpecVersion,
+  type Queue,
+  reenqueueActiveRuns,
+  type World,
+} from '@workflow/world';
 import { type AwsClients, createClients, destroyClients } from './clients.js';
 import { type AwsWorldOptions, resolveConfig } from './config.js';
+import { createSqsQueue } from './queue/index.js';
 import {
   createStorage,
   type RetryOptions,
@@ -24,9 +30,9 @@ export interface CreateWorldOptions extends AwsWorldOptions {
   retry?: Partial<RetryOptions>;
 }
 
-/** Thrown by the queue (until M2) and stream (until M3) methods. */
+/** Thrown by the stream methods (until M3). */
 export class NotImplementedError extends Error {
-  constructor(method: string, milestone: 'M2' | 'M3') {
+  constructor(method: string, milestone: 'M3') {
     super(
       `@joaquingiorgis/world-aws: ${method} is not implemented yet (${milestone})`
     );
@@ -36,44 +42,74 @@ export class NotImplementedError extends Error {
 
 function notImplemented(
   method: string,
-  milestone: 'M2' | 'M3'
+  milestone: 'M3'
 ): (...args: unknown[]) => never {
   return () => {
     throw new NotImplementedError(method, milestone);
   };
 }
 
+/** The AWS World: a `World` whose optional queue methods are all there. */
+export type AwsWorld = World &
+  Required<Pick<Queue, 'queueBatch' | 'registerHandler' | 'registerRoute'>> & {
+    start(): Promise<void>;
+    close(): Promise<void>;
+  };
+
 /**
  * Creates the AWS World.
  *
  * Storage (runs, steps, events, hooks, VM snapshots) lives in one DynamoDB
- * table. The queue (M2) and streams (M3) are not implemented yet and throw
+ * table, and the queue on two SQS standard queues (workflow and step).
+ * `start()` runs the queue worker in this process and re-enqueues the runs
+ * that have not ended. Streams (M3) are not implemented yet and throw
  * {@link NotImplementedError}.
  *
  * @param options - Explicit settings; anything left out is read from the
  *   `WORKFLOW_AWS_*` environment variables.
  */
-export function createWorld(options: CreateWorldOptions = {}): World {
+export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
   const config = resolveConfig(process.env, options);
   const clients = options.clients ?? createClients(config);
+  const storage = createStorage({
+    documents: clients.documents,
+    tableName: config.tableName,
+    ...(options.retry && { retry: options.retry }),
+  });
+  const queue = createSqsQueue({
+    sqs: clients.sqs,
+    documents: clients.documents,
+    tableName: config.tableName,
+    workflowQueueUrl: config.workflowQueueUrl,
+    stepQueueUrl: config.stepQueueUrl,
+    ...(config.endpoint !== undefined && { endpoint: config.endpoint }),
+    ...(config.baseUrl !== undefined && { baseUrl: config.baseUrl }),
+    concurrency: config.concurrency,
+    visibilityTimeoutSeconds: config.visibilityTimeoutSeconds,
+    pollWaitSeconds: config.pollWaitSeconds,
+    shutdownGraceMs: config.shutdownGraceMs,
+  });
+  let closing: Promise<void> | undefined;
 
   return {
     // Spec 9 runs only on request (`WORKFLOW_SPEC_VERSION=9`): the storage
-    // implements the in-band fence they need.
+    // implements the in-band fence they need. `maxConcurrency` is not
+    // declared: SQS standard queues cannot serialize a run's orchestrator
+    // deliveries across processes (see `queue/consumer.ts`).
     specVersion: mintedSpecVersion(process.env, {
       inBandFence: STORAGE_CAPABILITIES.inBandFence,
     }),
     capabilities: STORAGE_CAPABILITIES,
 
-    ...createStorage({
-      documents: clients.documents,
-      tableName: config.tableName,
-      ...(options.retry && { retry: options.retry }),
-    }),
+    ...storage,
 
-    getDeploymentId: notImplemented('getDeploymentId', 'M2'),
-    queue: notImplemented('queue', 'M2'),
-    createQueueHandler: notImplemented('createQueueHandler', 'M2'),
+    queueAuthMode: queue.queueAuthMode,
+    getDeploymentId: queue.getDeploymentId,
+    queue: queue.queue,
+    queueBatch: queue.queueBatch,
+    createQueueHandler: queue.createQueueHandler,
+    registerHandler: queue.registerHandler,
+    registerRoute: queue.registerRoute,
 
     streams: {
       write: notImplemented('streams.write', 'M3'),
@@ -84,8 +120,23 @@ export function createWorld(options: CreateWorldOptions = {}): World {
       getInfo: notImplemented('streams.getInfo', 'M3'),
     },
 
-    async close() {
-      if (!options.clients) destroyClients(clients);
+    async start() {
+      // Recovery, as world-postgres does on start: every run that has not
+      // ended gets a message, in case the one that would continue it was
+      // lost. A duplicate costs a replay that finds nothing to do, so the
+      // eventually consistent index read (a run created a moment ago may be
+      // missing, and its own message is in SQS anyway) is fine.
+      if (await queue.startWorker()) {
+        await reenqueueActiveRuns(storage.runs, queue.queue, 'world-aws');
+      }
+    },
+
+    close() {
+      closing ??= (async () => {
+        await queue.close();
+        if (!options.clients) destroyClients(clients);
+      })();
+      return closing;
     },
   };
 }
@@ -99,6 +150,12 @@ export {
   type AwsWorldOptions,
   resolveConfig,
 } from './config.js';
+export {
+  DEFAULT_MAX_RECEIVE_COUNT,
+  DEPLOYMENT_ID,
+  type SqsQueue,
+  type SqsQueueOptions,
+} from './queue/index.js';
 export {
   MAX_ITEM_BYTES,
   PAYLOAD_TOO_LARGE_CODE,

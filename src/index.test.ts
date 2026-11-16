@@ -1,4 +1,5 @@
 import { TransactionCanceledException } from '@aws-sdk/client-dynamodb';
+import { ReceiveMessageCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
 import {
   GetCommand,
   QueryCommand,
@@ -30,7 +31,7 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe('createWorld (M1)', () => {
+describe('createWorld', () => {
   it('validates the configuration up front', () => {
     expect(() => createWorld({ ...options, region: 'nope' })).toThrow(
       AwsWorldConfigError
@@ -74,27 +75,97 @@ describe('createWorld (M1)', () => {
     await world.close?.();
   });
 
-  it('throws "(M2)" from the queue and "(M3)" from streams', async () => {
+  it('implements the queue and throws "(M3)" from streams', async () => {
     const world = createWorld(options);
-    const calls: [string, string, () => unknown][] = [
-      ['getDeploymentId', 'M2', () => world.getDeploymentId()],
-      [
-        'queue',
-        'M2',
-        () => world.queue('__wkf_workflow_x' as never, {} as never),
-      ],
-      [
-        'streams.write',
-        'M3',
-        () => world.streams.write('wrun_x', 's', 'chunk'),
-      ],
-      ['streams.get', 'M3', () => world.streams.get('wrun_x', 's')],
+    expect(world.queueAuthMode).toBe('skip');
+    expect(await world.getDeploymentId()).toBe('aws');
+    expect(typeof world.queue).toBe('function');
+    expect(typeof world.queueBatch).toBe('function');
+    expect(typeof world.createQueueHandler('__wkf_workflow_', vi.fn())).toBe(
+      'function'
+    );
+    const calls: [string, () => unknown][] = [
+      ['streams.write', () => world.streams.write('wrun_x', 's', 'chunk')],
+      ['streams.get', () => world.streams.get('wrun_x', 's')],
     ];
-    for (const [method, milestone, call] of calls) {
+    for (const [method, call] of calls) {
       expect(call).toThrow(NotImplementedError);
-      expect(call).toThrow(`${method} is not implemented yet (${milestone})`);
+      expect(call).toThrow(`${method} is not implemented yet (M3)`);
     }
-    await world.close?.();
+    await world.close();
+  });
+
+  it('re-enqueues the runs that have not ended when it starts', async () => {
+    const clients = createClients(options);
+    const ddb = mockClient(clients.documents);
+    const sqs = mockClient(clients.sqs);
+    const run = (runId: string, extra: Record<string, unknown> = {}) => ({
+      PK: `RUN#${runId}`,
+      SK: 'META',
+      runId,
+      status: 'running',
+      deploymentId: 'aws',
+      workflowName: 'wf',
+      specVersion: 9,
+      input: new Uint8Array(),
+      createdAt: '2026-11-15T20:00:00.000Z',
+      updatedAt: '2026-11-15T20:00:00.000Z',
+      ...extra,
+    });
+    ddb.on(QueryCommand).resolves({
+      Items: [
+        run('wrun_01JD000000000000000000000A'),
+        run('wrun_01JD000000000000000000000B', {
+          status: 'pending',
+          specVersion: 8,
+          executionContext: { queueNamespace: 'agent' },
+        }),
+      ],
+    });
+    sqs.on(SendMessageCommand).resolves({});
+    sqs.on(ReceiveMessageCommand).callsFake(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return {};
+    });
+    const world = createWorld({
+      ...options,
+      workflowQueueUrl: `${options.workflowQueueUrl}-recovery`,
+      clients,
+      pollWaitSeconds: 0,
+    });
+    try {
+      await world.start();
+      const query = ddb.commandCalls(QueryCommand)[0]?.args[0].input;
+      expect(query?.IndexName).toBe('GSI3');
+      const sentBodies = sqs
+        .commandCalls(SendMessageCommand)
+        .map((call) => JSON.parse(call.args[0].input.MessageBody ?? '{}'));
+      expect(sentBodies.map((body) => [body.queueName, body.payload])).toEqual([
+        [
+          '__wkf_workflow_wf',
+          { runId: 'wrun_01JD000000000000000000000A', runSpecVersion: 9 },
+        ],
+        [
+          '__agent_wkf_workflow_wf',
+          { runId: 'wrun_01JD000000000000000000000B', runSpecVersion: 8 },
+        ],
+      ]);
+      // A second start of the same World recovers nothing again.
+      await world.start();
+      expect(sqs.commandCalls(SendMessageCommand)).toHaveLength(2);
+    } finally {
+      await world.close();
+      ddb.restore();
+      sqs.restore();
+      destroyClients(clients);
+    }
+  });
+
+  it('closes once', async () => {
+    const world = createWorld(options);
+    const first = world.close();
+    expect(world.close()).toBe(first);
+    await first;
   });
 
   it('passes `retry` to the storage', async () => {
