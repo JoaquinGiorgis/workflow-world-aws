@@ -26,11 +26,13 @@ jobs:
         node: [22, 24]
     steps:
       - uses: actions/checkout@v5
+      # pnpm must be on PATH before setup-node, which caches the pnpm store
+      # because package.json names pnpm in packageManager.
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
-      - name: Enable corepack
-        run: corepack enable
+          cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: Update @workflow/world to the latest in range (weekly run)
         if: github.event_name == 'schedule'
@@ -72,11 +74,13 @@ jobs:
       WORKFLOW_AWS_EMULATOR: localstack
     steps:
       - uses: actions/checkout@v5
+      # pnpm must be on PATH before setup-node, which caches the pnpm store
+      # because package.json names pnpm in packageManager.
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-      - name: Enable corepack
-        run: corepack enable
+          cache: pnpm
       - run: pnpm install --frozen-lockfile
       # The global setup finds LocalStack already answering, so it does not
       # start moto_server. It sets dummy credentials itself.
@@ -94,16 +98,18 @@ jobs:
       WORKFLOW_AWS_EMULATOR: moto
     steps:
       - uses: actions/checkout@v5
+      # pnpm must be on PATH before setup-node, which caches the pnpm store
+      # because package.json names pnpm in packageManager.
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
           node-version: 24
+          cache: pnpm
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: Install moto_server
         run: pip install "moto[server]>=5,<6"
-      - name: Enable corepack
-        run: corepack enable
       - run: pnpm install --frozen-lockfile
       # Nothing answers at the endpoint, so the global setup starts
       # moto_server (on PATH after pip install) and stops it afterwards.
