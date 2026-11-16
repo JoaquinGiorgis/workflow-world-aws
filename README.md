@@ -41,7 +41,11 @@ over its variable.
 
 `createWorld({ clients })` accepts SDK clients you created yourself (for
 instrumentation or custom credentials); the World does not destroy them on
-`close()`. `createWorld({ retry })` tunes how a write that loses a race with
+`close()`. The SQS client the World creates gives up on a request after 3
+attempts of at most 30 seconds each (`maxAttempts: 3`, `requestHandler:
+{ requestTimeout: 30_000, throwOnRequestTimeout: true }`), so one request
+takes at most 130 seconds with the SDK's backoff; an SQS client of your own
+should be bounded the same way (see Idempotency under [Queue](#queue)). `createWorld({ retry })` tunes how a write that loses a race with
 another writer of the same run is retried (`maxAttempts`,
 `immediateAttempts`, `baseDelayMs`, `maxDelayMs`): by default 40 attempts,
 the first two at once and then with exponential backoff and full jitter
@@ -133,7 +137,12 @@ not supported: they have no per-message delay.
   records the message id it sends under, and marks it sent afterwards. A
   later send under the key answers that id and sends nothing. A failed send
   gives the key back; a reservation whose sender died is taken over after
-  30 seconds, under the same id. Keys are kept for 24 hours (`expiresAt`,
+  10 minutes, under the same id. That is well past the longest an SQS
+  request can take (130 seconds, see [Configuration](#configuration)), so
+  a sender that is still sending is not overtaken. Marking the key sent
+  and giving it back only apply to the sender's own reservation; a sender
+  that was overtaken anyway logs a warning, since the message may then be
+  in the queue twice. Keys are kept for 24 hours (`expiresAt`,
   DynamoDB TTL), whether or not the message was delivered, as on Vercel
   Queues.
 - **Delays.** Up to 15 minutes with SQS's `DelaySeconds`. A longer delay is

@@ -111,9 +111,14 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
   const shared: SharedQueues = sharedQueues(
     [options.endpoint ?? '', workflowQueueUrl, stepQueueUrl].join('|')
   );
+  const log =
+    options.internal?.log ??
+    ((message: string, detail?: Record<string, unknown>) =>
+      console.warn(`[world-aws] ${message}`, detail ?? ''));
   const idempotency = new IdempotencyStore(
     options.documents,
-    options.tableName
+    options.tableName,
+    log
   );
   const agents = createNodeHttpAgents({
     maxSockets: Number.POSITIVE_INFINITY,
@@ -154,12 +159,16 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
   const queue: Queue['queue'] = async (queueName, payload, opts) => {
     parseQueueName(queueName);
     const key = opts?.idempotencyKey;
-    const reservation = key
-      ? await idempotency.reserve(key, newMessageId())
-      : { owner: true, messageId: newMessageId() };
-    if (!reservation.owner) return { messageId: reservation.messageId };
+    let messageId = newMessageId();
+    let reserved: { key: string; at: number } | undefined;
+    if (key) {
+      const reservation = await idempotency.reserve(key, messageId);
+      if (!reservation.owner) return { messageId: reservation.messageId };
+      messageId = reservation.messageId;
+      reserved = { key, at: reservation.reservedAt };
+    }
 
-    const message = prepare(queueName, payload, opts, reservation.messageId);
+    const message = prepare(queueName, payload, opts, messageId);
     try {
       await sendQueueMessage(
         sqs,
@@ -168,11 +177,15 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
         opts?.delaySeconds
       );
     } catch (error) {
-      if (key) await idempotency.release(key, reservation.messageId);
+      if (reserved) {
+        await idempotency.release(reserved.key, messageId, reserved.at);
+      }
       throw error;
     }
-    if (key) await idempotency.confirm(key, reservation.messageId);
-    return { messageId: reservation.messageId };
+    if (reserved) {
+      await idempotency.confirm(reserved.key, messageId, reserved.at);
+    }
+    return { messageId };
   };
 
   const queueBatch: NonNullable<Queue['queueBatch']> = async (
@@ -189,7 +202,8 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
     );
     type Pending = {
       index: number;
-      key?: string;
+      /** The idempotency key this send reserved, and when. */
+      reserved?: { key: string; at: number };
       message: QueueMessage;
       entry: SendMessageBatchRequestEntry;
       bytes: number;
@@ -199,6 +213,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
       messages.map(async ({ message: payload, opts }, index) => {
         const key = opts?.idempotencyKey;
         let messageId = newMessageId();
+        let reserved: Pending['reserved'];
         try {
           if (key) {
             const reservation = await idempotency.reserve(key, messageId);
@@ -207,6 +222,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
               return;
             }
             messageId = reservation.messageId;
+            reserved = { key, at: reservation.reservedAt };
           }
         } catch (error) {
           results[index] = {
@@ -228,7 +244,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
         const pending = byQueue.get(url) ?? [];
         pending.push({
           index,
-          ...(key !== undefined && { key }),
+          ...(reserved !== undefined && { reserved }),
           message,
           entry: {
             Id: String(index),
@@ -256,8 +272,13 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
           const each = byId.get(ok.Id);
           if (!each) continue;
           results[each.index] = { messageId: each.message.messageId };
-          if (each.key)
-            await idempotency.confirm(each.key, each.message.messageId);
+          if (each.reserved) {
+            await idempotency.confirm(
+              each.reserved.key,
+              each.message.messageId,
+              each.reserved.at
+            );
+          }
         }
         for (const failed of output.Failed ?? []) {
           const each = byId.get(failed.Id);
@@ -267,8 +288,13 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
             error: `${failed.Code ?? 'Error'}: ${failed.Message ?? 'not sent'}`,
             retryable: failed.SenderFault !== true,
           };
-          if (each.key)
-            await idempotency.release(each.key, each.message.messageId);
+          if (each.reserved) {
+            await idempotency.release(
+              each.reserved.key,
+              each.message.messageId,
+              each.reserved.at
+            );
+          }
         }
       } catch (error) {
         for (const each of chunk) {
@@ -277,8 +303,13 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
             error: describe(error),
             retryable: true,
           };
-          if (each.key)
-            await idempotency.release(each.key, each.message.messageId);
+          if (each.reserved) {
+            await idempotency.release(
+              each.reserved.key,
+              each.message.messageId,
+              each.reserved.at
+            );
+          }
         }
       }
     };
