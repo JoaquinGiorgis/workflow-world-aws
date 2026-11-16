@@ -17,7 +17,8 @@
  *   and a failed test prints what its table and queues hold.
  *
  * Every test of the suite runs: the only ones it skips are its own
- * (queue-auth tests for `queueAuthMode: 'loopback'` Worlds).
+ * (queue-auth tests for `queueAuthMode: 'loopback'` Worlds), and, in CI
+ * against moto only, the idempotency tests (see {@link skipIdempotency}).
  */
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -26,7 +27,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GetQueueAttributesCommand } from '@aws-sdk/client-sqs';
 import { ScanCommand } from '@aws-sdk/lib-dynamodb';
-import { afterAll, beforeAll, beforeEach, inject } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, inject } from 'vitest';
 import {
   createQueueWithDeadLetter,
   createWorkflowTable,
@@ -46,6 +47,24 @@ const suite = (name: string) =>
   createRequire(import.meta.url).resolve(
     `@workflow/world-testing/dist/src/${name}.mjs`
   );
+
+/**
+ * The suite's idempotency tests race many concurrent step completions on
+ * one run. moto_server (5.x) runs each request on its own thread and does
+ * not isolate concurrent `TransactWriteItems` (it copies the table, applies
+ * the transaction and restores the copy on a cancelled condition, with no
+ * lock), so another transaction's write can be lost and the run's event log
+ * gets a hole ("CorruptedEventLogError: ... hole at slot N"), failing the
+ * test after 60 s now and then. That is moto, not the World: the same tests
+ * pass against LocalStack, which isolates transactions as DynamoDB does and
+ * runs them in its own CI job. So the moto CI job (WORKFLOW_AWS_EMULATOR=moto
+ * with CI set) skips only these tests; run locally against moto they still
+ * run, and nothing is skipped against LocalStack or AWS.
+ */
+const skipIdempotency =
+  aws.moto &&
+  Boolean(process.env.CI) &&
+  process.env.WORKFLOW_AWS_EMULATOR?.trim().toLowerCase() === 'moto';
 
 type Suite = (world: string) => void;
 const load = async (name: string, exported: string) =>
@@ -135,7 +154,14 @@ export async function registerWorldTestingSuite(
 
   (await load('addition', 'addition'))(world);
   (await load('event-ids', 'eventIds'))(world);
-  (await load('idempotency', 'idempotency'))(world);
+  const idempotency = await load('idempotency', 'idempotency');
+  if (skipIdempotency) {
+    describe.skip('idempotency (moto in CI: see skipIdempotency)', () => {
+      idempotency(world);
+    });
+  } else {
+    idempotency(world);
+  }
   (await load('in-band-fence', 'inBandFence'))(world);
   (await load('hooks', 'hooks'))(world);
   (await load('null-byte', 'nullByte'))(world);

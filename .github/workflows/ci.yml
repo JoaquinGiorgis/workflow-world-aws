@@ -117,7 +117,10 @@ jobs:
 
   # The same suite against moto_server, the alternative that needs no
   # image or token. Pinned to a major so a moto release cannot break CI
-  # unrelated to a change.
+  # unrelated to a change. With CI and WORKFLOW_AWS_EMULATOR=moto set, the
+  # world-testing idempotency tests are skipped here: moto does not isolate
+  # concurrent transactions and loses an event now and then (see
+  # test/integration/world-testing-suite.ts). The LocalStack job runs them.
   integration-moto:
     name: Integration tests (moto_server)
     runs-on: ubuntu-latest

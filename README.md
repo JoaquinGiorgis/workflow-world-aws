@@ -657,7 +657,10 @@ suites send their DynamoDB requests one at a time (the world-testing
 servers do not). Set `WORKFLOW_AWS_EMULATOR` (`moto`, `localstack` or
 `aws`) to say which emulator answers; otherwise the setup tells moto from
 the rest. A failed `@workflow/world-testing` test prints its server's
-delivery trace and what its table and queues held.
+delivery trace and what its table and queues held. In CI (`CI` set)
+against moto, the `@workflow/world-testing` idempotency tests are skipped:
+moto's lost concurrent transactions leave holes in their event logs now
+and then. LocalStack runs them.
 
 CI runs lint, typecheck, unit tests and the build on Node 22 and 24, the
 example, and the integration suite against both LocalStack (which
@@ -670,9 +673,9 @@ isolates transactions as DynamoDB does) and moto_server 5.x.
   change before 1.0; changes are listed in `CHANGELOG.md`.
 - Tested: unit tests with mocked AWS clients, and the integration suite
   above, including `@workflow/world-testing` at spec 8 and 9, against
-  moto_server. The CI job against LocalStack is set up but has not run yet,
-  and nothing has been run against real AWS. The SAM template in
-  `examples/hono` is checked statically and has not been deployed. Treat
+  moto_server and, in CI, LocalStack. Nothing has been run against real
+  AWS. The SAM template in `examples/hono` is checked statically and has
+  not been deployed. Treat
   production use accordingly, and please report what you find.
 - Relation to [vercel/workflow#1371](https://github.com/vercel/workflow/pull/1371):
   that pull request, by another author, adds an AWS World inside the
