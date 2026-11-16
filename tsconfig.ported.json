@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": false,
+    "noImplicitAny": true,
+    "noUncheckedIndexedAccess": false,
+    "noEmit": true
+  },
+  "include": [
+    "test/integration/storage.test.ts",
+    "test/integration/slot-identity.test.ts",
+    "test/integration/hook-force-claim.test.ts",
+    "test/integration/in-band-fence.test.ts",
+    "test/integration/run-status-wait.test.ts",
+    "test/integration/fuzz-invariants.test.ts",
+    "test/integration/atomic-start-hook.test.ts",
+    "test/integration/snapshots.test.ts",
+    "test/integration/global-setup.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

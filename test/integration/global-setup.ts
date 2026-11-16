@@ -21,6 +21,12 @@ import {
 export interface IntegrationContext extends BootstrapResult {
   endpoint: string;
   region: string;
+  /**
+   * The emulator is moto_server, which runs each request on its own thread
+   * with no lock around TransactWriteItems. The storage tests then send their
+   * DynamoDB requests one at a time; see `test/integration/storage-context.ts`.
+   */
+  moto: boolean;
 }
 
 declare module 'vitest' {
@@ -33,11 +39,18 @@ const DEFAULT_ENDPOINT = 'http://localhost:4566';
 const STARTUP_TIMEOUT_MS = 30_000;
 
 async function isUp(endpoint: string): Promise<boolean> {
+  return (await serverHeader(endpoint)) !== undefined;
+}
+
+/** The `Server` header the endpoint answers with, or undefined if it is down. */
+async function serverHeader(endpoint: string): Promise<string | undefined> {
   try {
-    await fetch(endpoint, { signal: AbortSignal.timeout(1_000) });
-    return true;
+    const response = await fetch(endpoint, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    return response.headers.get('server') ?? '';
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -119,7 +132,11 @@ export default async function setup(project: TestProject) {
     bucket: `workflow-payloads-${suffix}`,
   });
 
-  project.provide('aws', { ...resources, endpoint, region });
+  // moto_server is a Werkzeug app; LocalStack and DynamoDB Local are not.
+  const isMoto =
+    moto !== undefined ||
+    /werkzeug/i.test((await serverHeader(endpoint)) ?? '');
+  project.provide('aws', { ...resources, endpoint, region, moto: isMoto });
 
   return async () => {
     if (moto && moto.exitCode === null) {

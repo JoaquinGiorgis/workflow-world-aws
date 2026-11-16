@@ -45,5 +45,32 @@
         "organizeImports": "on"
       }
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "test/integration/storage.test.ts",
+        "test/integration/slot-identity.test.ts",
+        "test/integration/hook-force-claim.test.ts",
+        "test/integration/in-band-fence.test.ts",
+        "test/integration/run-status-wait.test.ts",
+        "test/integration/fuzz-invariants.test.ts",
+        "test/integration/atomic-start-hook.test.ts",
+        "test/integration/snapshots.test.ts"
+      ],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noUnsafeOptionalChaining": "off"
+          },
+          "style": {
+            "noNonNullAssertion": "off"
+          },
+          "suspicious": {
+            "noExplicitAny": "off"
+          }
+        }
+      }
+    }
+  ]
 }

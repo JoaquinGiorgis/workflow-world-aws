@@ -22,5 +22,16 @@
     "outDir": "dist"
   },
   "include": ["src", "scripts", "test", "*.config.ts"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test/integration/storage.test.ts",
+    "test/integration/slot-identity.test.ts",
+    "test/integration/hook-force-claim.test.ts",
+    "test/integration/in-band-fence.test.ts",
+    "test/integration/run-status-wait.test.ts",
+    "test/integration/fuzz-invariants.test.ts",
+    "test/integration/atomic-start-hook.test.ts",
+    "test/integration/snapshots.test.ts"
+  ]
 }
