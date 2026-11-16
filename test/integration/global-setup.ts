@@ -8,7 +8,8 @@
  * 2. Sets dummy `test`/`test` credentials in this process's environment,
  *    which the test workers inherit. Emulators accept any credentials.
  * 3. Creates a fresh table, queues and bucket with the bootstrap script and
- *    hands their names to the tests through `inject('aws')`.
+ *    hands their names to the tests through `inject('aws')`, with which
+ *    emulator it is (see {@link detectEmulator}).
  */
 import { type ChildProcess, spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -52,6 +53,40 @@ async function serverHeader(endpoint: string): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/** Whether LocalStack answers its health endpoint at `endpoint`. */
+async function isLocalStack(endpoint: string): Promise<boolean> {
+  try {
+    const response = await fetch(new URL('/_localstack/health', endpoint), {
+      signal: AbortSignal.timeout(1_000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Which emulator answers, so the moto-only workaround (one DynamoDB
+ * request at a time in the storage suites) never runs against LocalStack
+ * or DynamoDB. `WORKFLOW_AWS_EMULATOR` (`moto`, `localstack`, `aws`) says
+ * it outright, as CI does; otherwise moto is the one this setup started, or
+ * a Werkzeug server that is not LocalStack.
+ */
+async function detectEmulator(
+  endpoint: string,
+  started: boolean
+): Promise<'moto' | 'localstack' | 'other'> {
+  const declared = process.env.WORKFLOW_AWS_EMULATOR?.trim().toLowerCase();
+  if (declared === 'moto') return 'moto';
+  if (declared === 'localstack') return 'localstack';
+  if (declared) return 'other';
+  if (started) return 'moto';
+  if (await isLocalStack(endpoint)) return 'localstack';
+  return /werkzeug/i.test((await serverHeader(endpoint)) ?? '')
+    ? 'moto'
+    : 'other';
 }
 
 async function startMoto(endpoint: string): Promise<ChildProcess> {
@@ -132,16 +167,41 @@ export default async function setup(project: TestProject) {
     bucket: `workflow-payloads-${suffix}`,
   });
 
-  // moto_server is a Werkzeug app; LocalStack and DynamoDB Local are not.
-  const isMoto =
-    moto !== undefined ||
-    /werkzeug/i.test((await serverHeader(endpoint)) ?? '');
-  project.provide('aws', { ...resources, endpoint, region, moto: isMoto });
+  const emulator = await detectEmulator(endpoint, moto !== undefined);
+  console.log(
+    `[integration] emulator: ${emulator}${emulator === 'moto' ? ' (storage suites send DynamoDB requests one at a time)' : ''}`
+  );
+  project.provide('aws', {
+    ...resources,
+    endpoint,
+    region,
+    moto: emulator === 'moto',
+  });
 
   return async () => {
-    if (moto && moto.exitCode === null) {
-      moto.kill('SIGTERM');
-      console.log('[integration] stopped moto_server');
-    }
+    if (moto) await stopMoto(moto);
   };
+}
+
+/**
+ * Stops moto_server and waits until it has exited, so its process handle
+ * and stderr pipe do not keep Vitest's main process alive (which Vitest
+ * reports as "something prevents Vite servers from exiting"). Its
+ * threaded server can keep running on SIGTERM while clients hold
+ * keep-alive connections, so it gets SIGKILL after 3 seconds.
+ */
+async function stopMoto(moto: ChildProcess): Promise<void> {
+  if (moto.exitCode === null && moto.signalCode === null) {
+    const exited = new Promise<void>((resolve) =>
+      moto.once('exit', () => resolve())
+    );
+    moto.kill('SIGTERM');
+    const timer = setTimeout(() => moto.kill('SIGKILL'), 3_000);
+    await exited;
+    clearTimeout(timer);
+  }
+  moto.stderr?.destroy();
+  console.log(
+    `[integration] stopped moto_server (${moto.signalCode ?? `exit ${moto.exitCode}`})`
+  );
 }
