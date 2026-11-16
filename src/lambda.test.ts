@@ -23,7 +23,9 @@ import {
   type SqsLambdaEvent,
   type SqsLambdaRecord,
 } from './index.js';
+import { handleSqsEvent } from './queue/lambda.js';
 import { decodeMessage, type QueueMessage } from './queue/message.js';
+import type { RunGate } from './queue/state.js';
 
 const prefix = '__wkf_workflow_';
 type Handler = Parameters<AwsWorld['createQueueHandler']>[1];
@@ -344,6 +346,89 @@ describe('createSqsLambdaHandler', () => {
     }
   });
 
+  it.each([
+    [
+      'a missing GSI3',
+      Object.assign(
+        new Error('The table does not have the specified index: GSI3'),
+        {
+          name: 'ValidationException',
+          $fault: 'client',
+          $metadata: { httpStatusCode: 400 },
+        }
+      ),
+    ],
+    [
+      'access denied',
+      Object.assign(new Error('not authorized to perform: dynamodb:Query'), {
+        name: 'AccessDeniedException',
+        $fault: 'client',
+        $metadata: { httpStatusCode: 400 },
+      }),
+    ],
+  ])(
+    'does not try recovery again in the process after %s',
+    async (_, error) => {
+      ddb.on(QueryCommand).rejects(error);
+      const log = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const lambda = createSqsLambdaHandler({
+          world: world(async () => undefined),
+        });
+        for (let i = 0; i < 3; i++) {
+          expect(
+            await lambda(event(record({ payload: { runId: 'wrun_A' } })))
+          ).toEqual({ batchItemFailures: [] });
+        }
+        expect(
+          ddb
+            .commandCalls(QueryCommand)
+            .filter((call) => call.args[0].input.IndexName === 'GSI3')
+        ).toHaveLength(1);
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(log).toHaveBeenCalledWith(
+          expect.stringContaining('not trying again'),
+          expect.anything()
+        );
+      } finally {
+        log.mockRestore();
+      }
+    }
+  );
+
+  it('tries recovery again on the next event after a throttled query', async () => {
+    ddb
+      .on(QueryCommand)
+      .rejectsOnce(
+        Object.assign(new Error('Rate of requests exceeds the allowed'), {
+          name: 'ThrottlingException',
+          $fault: 'client',
+          $metadata: { httpStatusCode: 400 },
+          $retryable: { throttling: true },
+        })
+      )
+      .resolves({ Items: [] });
+    const log = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const lambda = createSqsLambdaHandler({
+        world: world(async () => undefined),
+      });
+      await lambda(event(record({ payload: { runId: 'wrun_A' } })));
+      await lambda(event(record({ payload: { runId: 'wrun_A' } })));
+      expect(
+        ddb
+          .commandCalls(QueryCommand)
+          .filter((call) => call.args[0].input.IndexName === 'GSI3')
+      ).toHaveLength(2);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining('trying again on the next event'),
+        expect.anything()
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('takes an event typed with @types/aws-lambda', () => {
     // The shapes of SQSEvent in @types/aws-lambda (trigger/sqs.d.ts),
     // without adding the package: they must be assignable to ours.
@@ -387,5 +472,44 @@ describe('createSqsLambdaHandler', () => {
     await lambda(event(record({ payload: { runId: 'wrun_A' } })));
     await lambda(event(record({ payload: { runId: 'wrun_A' } })));
     expect(factory).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('handleSqsEvent', () => {
+  it('backs off a record whose handling throws, and reports it', async () => {
+    const log = vi.fn();
+    const failed = record(
+      { payload: { runId: 'wrun_A', runSpecVersion: 9 } },
+      3
+    );
+    const response = await handleSqsEvent(
+      {
+        sqs: clients.sqs,
+        queueUrls: [queueUrl(names.workflow), queueUrl(names.step)],
+        concurrency: 1,
+        // Throws where nothing in handleRecord catches it.
+        runGate: {
+          acquire: () => Promise.reject(new Error('gate')),
+        } as unknown as RunGate,
+        deliver: async () => ({ type: 'completed' }),
+        log,
+      },
+      event(failed)
+    );
+    expect(response).toEqual({
+      batchItemFailures: [{ itemIdentifier: failed.messageId }],
+    });
+    expect(log).toHaveBeenCalledWith(
+      'A queue record could not be handled',
+      expect.anything()
+    );
+    expect(
+      sqs.commandCalls(ChangeMessageVisibilityCommand)[0]?.args[0].input
+    ).toEqual({
+      QueueUrl: queueUrl(names.workflow),
+      ReceiptHandle: failed.receiptHandle,
+      // e^3 seconds, the same backoff as a failed delivery.
+      VisibilityTimeout: 21,
+    });
   });
 });
