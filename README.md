@@ -58,22 +58,22 @@ capped at 250 ms, after which the write fails with a 503
 
 Everything lives in one table (on-demand billing, TTL on `expiresAt`):
 
-| Item                | PK                  | SK                     |
-| ------------------- | ------------------- | ---------------------- |
-| Run                 | `RUN#<runId>`       | `META`                 |
-| Event               | `RUN#<runId>`       | `EVT#<eventId>`        |
-| Step                | `RUN#<runId>`       | `STEP#<stepId>`        |
-| Hook                | `RUN#<runId>`       | `HOOK#<hookId>`        |
-| Wait                | `RUN#<runId>`       | `WAIT#<correlationId>` |
-| VM snapshot         | `RUN#<runId>`       | `SNAPSHOT`             |
-| Hook resume id      | `RUN#<runId>`       | `RESUME#<resumeId>`    |
-| `attr_set` id       | `RUN#<runId>`       | `ATTR#<correlationId>` |
-| Start Hook decision | `RUN#<runId>`       | `ADMISSION`            |
-| Hook id → run       | `HOOKID#<hookId>`   | `HOOK`                 |
-| Hook token claim    | `HOOKTOKEN#<token>` | `TOKEN`                |
-| Stream chunk        | `STREAM#<runId>#<name>` | `CHUNK#<seq>`      |
-| Stream end          | `STREAM#<runId>#<name>` | `CLOSED`           |
-| Stream name         | `STREAMS#<runId>`   | `NAME#<name>`          |
+| Item                | PK                      | SK                     |
+| ------------------- | ----------------------- | ---------------------- |
+| Run                 | `RUN#<runId>`           | `META`                 |
+| Event               | `RUN#<runId>`           | `EVT#<eventId>`        |
+| Step                | `RUN#<runId>`           | `STEP#<stepId>`        |
+| Hook                | `RUN#<runId>`           | `HOOK#<hookId>`        |
+| Wait                | `RUN#<runId>`           | `WAIT#<correlationId>` |
+| VM snapshot         | `RUN#<runId>`           | `SNAPSHOT`             |
+| Hook resume id      | `RUN#<runId>`           | `RESUME#<resumeId>`    |
+| `attr_set` id       | `RUN#<runId>`           | `ATTR#<correlationId>` |
+| Start Hook decision | `RUN#<runId>`           | `ADMISSION`            |
+| Hook id → run       | `HOOKID#<hookId>`       | `HOOK`                 |
+| Hook token claim    | `HOOKTOKEN#<token>`     | `TOKEN`                |
+| Stream chunk        | `STREAM#<runId>#<name>` | `CHUNK#<seq>`          |
+| Stream end          | `STREAM#<runId>#<name>` | `CLOSED`               |
+| Stream name         | `STREAMS#<runId>`       | `NAME#<name>`          |
 
 GSI1 lists every run (`RUNS`) and every hook (`HOOKS`) by id; GSI2 lists
 the runs of one workflow (`WF#<workflowName>`); GSI3 is sparse and lists
