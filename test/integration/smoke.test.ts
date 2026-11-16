@@ -119,7 +119,7 @@ describe('smoke test against the local emulator', () => {
         attributes.Attributes?.RedrivePolicy ?? '{}'
       ) as { deadLetterTargetArn?: string; maxReceiveCount?: unknown };
       expect(policy.deadLetterTargetArn).toMatch(/-dlq$/);
-      expect(Number(policy.maxReceiveCount)).toBe(5);
+      expect(Number(policy.maxReceiveCount)).toBe(73);
     }
   });
 

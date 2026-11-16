@@ -149,6 +149,18 @@ describe('bootstrapLocal', () => {
     });
   });
 
+  it('lets SQS retry for days before the dead-letter queue, by default', async () => {
+    await bootstrapLocal({ ...base, clients });
+    const workflow = sqs
+      .commandCalls(CreateQueueCommand)
+      .map((call) => call.args[0].input)
+      .find((input) => input.QueueName === 'workflow');
+    expect(workflow?.Attributes?.MessageRetentionPeriod).toBe('1209600');
+    expect(
+      JSON.parse(workflow?.Attributes?.RedrivePolicy ?? '{}').maxReceiveCount
+    ).toBe('73');
+  });
+
   it('creates the bucket without a location constraint in us-east-1', async () => {
     await bootstrapLocal({ ...base, clients });
 

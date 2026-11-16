@@ -34,6 +34,10 @@ import {
   destroyClients,
 } from '../src/clients.js';
 import { GSI1_NAME, GSI2_NAME, GSI3_NAME } from '../src/keys.js';
+import { DEFAULT_MAX_RECEIVE_COUNT } from '../src/queue/index.js';
+
+/** SQS's longest retention, 14 days, for both queues and dead letters. */
+const MESSAGE_RETENTION_SECONDS = '1209600';
 
 /** Attribute the table's TTL reads (epoch seconds). */
 export const TTL_ATTRIBUTE = 'expiresAt';
@@ -45,7 +49,12 @@ export interface BootstrapOptions {
   workflowQueueName: string;
   stepQueueName: string;
   bucket: string;
-  /** Receives before SQS moves a message to the dead-letter queue. */
+  /**
+   * Receives before SQS moves a message to the dead-letter queue. Default
+   * {@link DEFAULT_MAX_RECEIVE_COUNT} (73): a failed delivery is retried
+   * with a backoff of up to an hour, for days, as world-postgres retries a
+   * job, so the runtime's own delivery cap (49) is reached first.
+   */
   maxReceiveCount?: number;
   visibilityTimeoutSeconds?: number;
   /** Clients to use instead of creating (and destroying) new ones. */
@@ -70,7 +79,8 @@ export async function bootstrapLocal(
   try {
     await createWorkflowTable(clients, options.tableName);
 
-    const maxReceiveCount = options.maxReceiveCount ?? 5;
+    const maxReceiveCount =
+      options.maxReceiveCount ?? DEFAULT_MAX_RECEIVE_COUNT;
     const visibilityTimeoutSeconds = options.visibilityTimeoutSeconds ?? 60;
     const workflow = await createQueueWithDeadLetter(
       clients.sqs,
@@ -182,7 +192,11 @@ export async function createWorkflowTable(
   }
 }
 
-async function createQueueWithDeadLetter(
+/**
+ * Creates a standard queue and its dead-letter queue (`<name>-dlq`), with a
+ * redrive policy after `maxReceiveCount` receives. Keeps queues that exist.
+ */
+export async function createQueueWithDeadLetter(
   sqs: SQSClient,
   name: string,
   maxReceiveCount: number,
@@ -191,7 +205,7 @@ async function createQueueWithDeadLetter(
   const deadLetter = await sqs.send(
     new CreateQueueCommand({
       QueueName: `${name}-dlq`,
-      Attributes: { MessageRetentionPeriod: '1209600' },
+      Attributes: { MessageRetentionPeriod: MESSAGE_RETENTION_SECONDS },
     })
   );
   const deadLetterQueueUrl = requireValue(
@@ -215,6 +229,9 @@ async function createQueueWithDeadLetter(
       QueueName: name,
       Attributes: {
         VisibilityTimeout: String(visibilityTimeoutSeconds),
+        // Retries back off for days; the default four days could drop a
+        // message before its retries (or its dead-letter move) are done.
+        MessageRetentionPeriod: MESSAGE_RETENTION_SECONDS,
         RedrivePolicy: JSON.stringify({
           deadLetterTargetArn: deadLetterArn,
           maxReceiveCount: String(maxReceiveCount),
