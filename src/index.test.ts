@@ -364,9 +364,9 @@ describe('createWorld', () => {
         });
         const recoveredAt = Number(guard?.Item?.recoveredAt);
         expect(recoveredAt).toBeGreaterThanOrEqual(before);
-        expect(
-          guard?.ExpressionAttributeValues?.[':cutoff']
-        ).toBe(recoveredAt - 900_000);
+        expect(guard?.ExpressionAttributeValues?.[':cutoff']).toBe(
+          recoveredAt - 900_000
+        );
         expect(Number(guard?.Item?.expiresAt)).toBeGreaterThan(
           recoveredAt / 1000 + 900
         );
@@ -430,11 +430,13 @@ describe('createWorld', () => {
     const clients = createClients(options);
     const ddb = mockClient(clients.documents);
     const sqs = mockClient(clients.sqs);
-    ddb.on(QueryCommand).callsFake(async (input: { IndexName?: string }) =>
-      input.IndexName
-        ? { Items: [] }
-        : { Items: [{ PK: 'STREAM#wrun_x#s', SK: 'CLOSED', count: 0 }] }
-    );
+    ddb
+      .on(QueryCommand)
+      .callsFake(async (input: { IndexName?: string }) =>
+        input.IndexName
+          ? { Items: [] }
+          : { Items: [{ PK: 'STREAM#wrun_x#s', SK: 'CLOSED', count: 0 }] }
+      );
     ddb.on(GetCommand).resolves({});
     ddb.on(PutCommand).resolves({});
     sqs.on(SendMessageCommand).resolves({});
