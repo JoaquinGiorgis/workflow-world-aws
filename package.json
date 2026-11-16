@@ -7,14 +7,21 @@
   "author": "Joaquín Giorgis",
   "repository": {
     "type": "git",
-    "url": "https://github.com/JoaquinGiorgis/workflow-world-aws.git"
+    "url": "git+https://github.com/JoaquinGiorgis/workflow-world-aws.git"
+  },
+  "homepage": "https://github.com/JoaquinGiorgis/workflow-world-aws#readme",
+  "bugs": {
+    "url": "https://github.com/JoaquinGiorgis/workflow-world-aws/issues"
   },
   "keywords": [
     "workflow",
+    "workflow-sdk",
     "world",
     "aws",
     "dynamodb",
-    "sqs"
+    "sqs",
+    "s3",
+    "lambda"
   ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -22,10 +29,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./iam-policy.json": "./docs/iam-policy.json",
+    "./package.json": "./package.json"
   },
+  "sideEffects": false,
   "files": [
-    "dist"
+    "dist",
+    "docs/iam-policy.json"
   ],
   "publishConfig": {
     "access": "public"
