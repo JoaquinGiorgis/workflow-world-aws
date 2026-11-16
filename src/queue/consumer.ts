@@ -670,7 +670,7 @@ export function describe(error: unknown): string {
 
 /** SQS's receive count of a message, at least 1. */
 export function receiveCountOf(
-  attributes: Record<string, string | undefined> | undefined
+  attributes: { ApproximateReceiveCount?: string } | undefined
 ): number {
   return Math.max(1, Number(attributes?.ApproximateReceiveCount ?? 1) || 1);
 }

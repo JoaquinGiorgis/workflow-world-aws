@@ -344,6 +344,43 @@ describe('createSqsLambdaHandler', () => {
     }
   });
 
+  it('takes an event typed with @types/aws-lambda', () => {
+    // The shapes of SQSEvent in @types/aws-lambda (trigger/sqs.d.ts),
+    // without adding the package: they must be assignable to ours.
+    interface SQSRecordAttributes {
+      AWSTraceHeader?: string;
+      ApproximateReceiveCount: string;
+      SentTimestamp: string;
+      SenderId: string;
+      ApproximateFirstReceiveTimestamp: string;
+      SequenceNumber?: string;
+      MessageGroupId?: string;
+      MessageDeduplicationId?: string;
+      DeadLetterQueueSourceArn?: string;
+    }
+    interface SQSMessageAttributes {
+      [name: string]: { stringValue?: string; dataType: string };
+    }
+    interface SQSRecord {
+      messageId: string;
+      receiptHandle: string;
+      body: string;
+      attributes: SQSRecordAttributes;
+      messageAttributes: SQSMessageAttributes;
+      md5OfBody: string;
+      md5OfMessageAttributes?: string;
+      eventSource: string;
+      eventSourceARN: string;
+      awsRegion: string;
+    }
+    interface SQSEvent {
+      Records: SQSRecord[];
+    }
+    const theirs: SQSEvent = { Records: [] };
+    const ours: SqsLambdaEvent = theirs;
+    expect(ours.Records).toEqual([]);
+  });
+
   it('creates its World once, from a factory', async () => {
     const factory = vi.fn(() => world(async () => undefined));
     const lambda = createSqsLambdaHandler({ world: factory });

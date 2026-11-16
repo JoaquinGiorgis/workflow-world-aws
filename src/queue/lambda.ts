@@ -53,8 +53,9 @@ import type { QueueMessage } from './message.js';
 import type { RunGate } from './state.js';
 
 /**
- * One record of an SQS event, as Lambda passes it: the fields the World
- * reads, a subset of `SQSRecord` in `@types/aws-lambda`.
+ * One record of an SQS event, as Lambda passes it. The same shape as
+ * `SQSRecord` in `@types/aws-lambda` with every field the World does not
+ * read optional, so a record typed with that package can be passed.
  */
 export interface SqsLambdaRecord {
   messageId: string;
@@ -62,7 +63,14 @@ export interface SqsLambdaRecord {
   body: string;
   attributes: {
     ApproximateReceiveCount?: string;
-    [name: string]: string | undefined;
+    SentTimestamp?: string;
+    SenderId?: string;
+    ApproximateFirstReceiveTimestamp?: string;
+    AWSTraceHeader?: string;
+    SequenceNumber?: string;
+    MessageGroupId?: string;
+    MessageDeduplicationId?: string;
+    DeadLetterQueueSourceArn?: string;
   };
   /** `arn:aws:sqs:<region>:<account>:<queue name>`. */
   eventSourceARN: string;
