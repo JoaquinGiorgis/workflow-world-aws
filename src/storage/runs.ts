@@ -87,11 +87,11 @@ export function createRunsStorage(
       const indexKeys = byWorkflow
         ? ['GSI2PK', 'GSI2SK']
         : ['GSI1PK', 'GSI1SK'];
-      const values: Record<string, unknown> = {
-        ':pk': byWorkflow
-          ? `${PREFIX.runsByWorkflow}${params?.workflowName}`
-          : ALL_RUNS_GSI1PK,
-      };
+      const partition = byWorkflow
+        ? `${PREFIX.runsByWorkflow}${params?.workflowName}`
+        : ALL_RUNS_GSI1PK;
+      const scope = `${byWorkflow ? GSI2_NAME : GSI1_NAME}:${partition}`;
+      const values: Record<string, unknown> = { ':pk': partition };
       statuses?.forEach((status, i) => {
         values[`:s${i}`] = status;
       });
@@ -106,7 +106,7 @@ export function createRunsStorage(
           }),
           ExpressionAttributeValues: values,
           ScanIndexForward: ascending,
-          ...(cursor && { ExclusiveStartKey: decodeCursor(cursor) }),
+          ...(cursor && { ExclusiveStartKey: decodeCursor(scope, cursor) }),
         },
         limit + 1
       );
@@ -116,7 +116,7 @@ export function createRunsStorage(
       return {
         data: page.map((item) => filterRunData(runFromItem(item), resolveData)),
         hasMore: items.length > limit,
-        cursor: last ? cursorOf(last, indexKeys) : null,
+        cursor: last ? cursorOf(scope, last, indexKeys) : null,
       };
     }) as Storage['runs']['list'],
 

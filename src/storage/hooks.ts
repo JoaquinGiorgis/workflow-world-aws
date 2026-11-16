@@ -147,9 +147,12 @@ export function createHooksStorage(table: Table): Storage['hooks'] {
             ExpressionAttributeValues: { ':pk': ALL_HOOKS_GSI1PK },
           };
       const indexKeys = params.runId ? [] : ['GSI1PK', 'GSI1SK'];
+      const scope = params.runId
+        ? `table:${runPk(params.runId)}:${PREFIX.hook}`
+        : `${GSI1_NAME}:${ALL_HOOKS_GSI1PK}`;
       const found: Item[] = [];
       let startKey: Record<string, unknown> | undefined = cursor
-        ? decodeCursor(cursor)
+        ? decodeCursor(scope, cursor)
         : undefined;
       do {
         const page = await table.queryPage({
@@ -168,7 +171,7 @@ export function createHooksStorage(table: Table): Storage['hooks'] {
         data: values.map((item) =>
           filterHookData(hookFromItem(item), resolveData)
         ),
-        cursor: last ? cursorOf(last, indexKeys) : null,
+        cursor: last ? cursorOf(scope, last, indexKeys) : null,
         hasMore: found.length > limit,
       };
     },

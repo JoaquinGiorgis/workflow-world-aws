@@ -19,6 +19,7 @@ export function createStepsStorage(table: Table): Storage['steps'] {
       // `step_<ulid>`, so id order is creation order).
       const ascending = params?.pagination?.sortOrder === 'asc';
       const cursor = params?.pagination?.cursor;
+      const scope = `table:${runPk(params.runId)}:${PREFIX.step}`;
       const items = await table.collect(
         {
           KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
@@ -28,7 +29,7 @@ export function createStepsStorage(table: Table): Storage['steps'] {
           },
           ConsistentRead: true,
           ScanIndexForward: ascending,
-          ...(cursor && { ExclusiveStartKey: decodeCursor(cursor) }),
+          ...(cursor && { ExclusiveStartKey: decodeCursor(scope, cursor) }),
         },
         limit + 1
       );
@@ -40,7 +41,7 @@ export function createStepsStorage(table: Table): Storage['steps'] {
           filterStepData(stepFromItem(item), resolveData)
         ),
         hasMore: items.length > limit,
-        cursor: last ? cursorOf(last) : null,
+        cursor: last ? cursorOf(scope, last) : null,
       };
     }) as Storage['steps']['list'],
   };
