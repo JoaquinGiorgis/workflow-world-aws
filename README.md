@@ -3,12 +3,14 @@
 A [Workflow SDK](https://github.com/vercel/workflow) World backed by AWS:
 DynamoDB for storage, SQS for the queue and S3 for large payloads.
 
-> **Status: work in progress, M2.** Storage (runs, steps, events, hooks,
-> waits and VM snapshots in one DynamoDB table) and the queue (two SQS
-> standard queues with a worker in the app's process) are implemented, and
-> workflows that do not use streams run. Streams throw
-> `not implemented yet (M3)`. The package name is provisional and nothing
-> is published to npm.
+> **Status: work in progress, M3.** Storage (runs, steps, events, hooks,
+> waits and VM snapshots in one DynamoDB table), streams (in the same
+> table), the queue (two SQS standard queues with a worker in the app's
+> process) and S3 for payloads too large for DynamoDB or SQS are
+> implemented, and the whole `@workflow/world-testing` suite passes at
+> spec 8 and spec 9 against moto_server. Not yet: Lambda mode, an example
+> app, a release. The package name is provisional and nothing is
+> published to npm.
 
 ## Configuration
 
@@ -18,7 +20,7 @@ DynamoDB for storage, SQS for the queue and S3 for large payloads.
 | `WORKFLOW_AWS_TABLE`              | yes      | DynamoDB table name                                                           |
 | `WORKFLOW_AWS_WORKFLOW_QUEUE_URL` | yes      | SQS queue URL for workflow messages                                           |
 | `WORKFLOW_AWS_STEP_QUEUE_URL`     | yes      | SQS queue URL for step messages                                               |
-| `WORKFLOW_AWS_BUCKET`             | no       | S3 bucket for payloads over the DynamoDB item limit                           |
+| `WORKFLOW_AWS_BUCKET`             | no       | S3 bucket for payloads too large for DynamoDB or SQS (see [S3](#s3))          |
 | `WORKFLOW_AWS_ENDPOINT`           | no       | Endpoint override for LocalStack or moto, for example `http://localhost:4566` |
 | `WORKFLOW_AWS_BASE_URL`           | no       | Base URL of the app the queue delivers to over HTTP (see [Queue](#queue))     |
 
@@ -31,7 +33,7 @@ never reads or stores them itself.
 | `WORKFLOW_AWS_VISIBILITY_TIMEOUT_SECONDS` | `visibilityTimeoutSeconds` | `60`    | Visibility timeout of a received message, renewed while it runs |
 | `WORKFLOW_AWS_SHUTDOWN_GRACE_MS`          | `shutdownGraceMs`          | `30000` | How long `close()` waits for running deliveries                 |
 | `WORKFLOW_AWS_POLL_WAIT_SECONDS`          | `pollWaitSeconds`          | `20`    | Long polling wait of each `ReceiveMessage` (0-20)               |
-| `WORKFLOW_AWS_STREAM_POLL_INTERVAL_MS`    | `streamPollIntervalMs`     | `250`   | Poll interval of live stream reads (M3)                         |
+| `WORKFLOW_AWS_STREAM_POLL_INTERVAL_MS`    | `streamPollIntervalMs`     | `250`   | How often a live stream reader looks for new chunks             |
 | `WORKFLOW_AWS_HOOK_RETENTION_LIMIT_DAYS`  |                            | `30`    | Longest `experimental_minRetention` a hook may ask for, days    |
 
 Every variable but the last can also be passed to `createWorld()`
@@ -69,6 +71,9 @@ Everything lives in one table (on-demand billing, TTL on `expiresAt`):
 | Start Hook decision | `RUN#<runId>`       | `ADMISSION`            |
 | Hook id → run       | `HOOKID#<hookId>`   | `HOOK`                 |
 | Hook token claim    | `HOOKTOKEN#<token>` | `TOKEN`                |
+| Stream chunk        | `STREAM#<runId>#<name>` | `CHUNK#<seq>`      |
+| Stream end          | `STREAM#<runId>#<name>` | `CLOSED`           |
+| Stream name         | `STREAMS#<runId>`   | `NAME#<name>`          |
 
 GSI1 lists every run (`RUNS`) and every hook (`HOOKS`) by id; GSI2 lists
 the runs of one workflow (`WF#<workflowName>`); GSI3 is sparse and lists
@@ -101,14 +106,16 @@ every 500 ms.
 
 Limits:
 
-- DynamoDB stores items of up to 400 KB. The World refuses any item over
-  350 KB, keeping the rest as margin for key and index attributes: a write
-  that would store a larger payload (step input or output, run input or
-  output, hook payload, VM snapshot), or grow the run item past it (input,
-  output, error and attributes live on one item), is refused with
-  `PayloadTooLargeError` (`status: 413`, `code: 'PAYLOAD_TOO_LARGE'`) before
-  anything is written. If DynamoDB itself refuses an item for its size, the
-  same error is raised. Offloading large payloads to S3 is planned (M3).
+- DynamoDB stores items of up to 400 KB. The World keeps every item under
+  350 KB (the rest is margin for key and index attributes) and every
+  transaction under 4 MB by moving the largest values to S3 (see
+  [S3](#s3)). Without a bucket, a write that would not fit (a large step
+  input or output, run input or output, hook payload, VM snapshot or
+  stream chunk, or a run item grown past it: input, output, error and
+  attributes live on one item) is refused with `PayloadTooLargeError`
+  (`status: 413`, `code: 'PAYLOAD_TOO_LARGE'`) before anything is written;
+  its message says to set `bucket` / `WORKFLOW_AWS_BUCKET`. If DynamoDB
+  itself refuses an item for its size, the same error is raised.
 - Pagination cursors of `runs.list`, `steps.list` and `hooks.list` are
   opaque and only valid for the list (index, run or workflow) that returned
   them; any other cursor is refused with a 400 `WorkflowWorldError`.
@@ -142,6 +149,73 @@ carry the attributes from their creation. `backfillActiveRunIndex(clients,
 tableName)` in `scripts/bootstrap-local.ts` does exactly that (a scan and a
 conditional update per run, safe to run again) with whatever clients you
 pass it.
+
+## Streams
+
+A stream is a partition of the table, `STREAM#<runId>#<name>`, holding
+numbered chunks (`CHUNK#<seq>`, 0-based, zero-padded) and, once it is
+closed, a `CLOSED` item with the number of chunks. `CLOSED` sorts after
+every chunk, so one query from a position returns what follows and, at the
+end, whether the stream is done.
+
+- **Writes.** `write` and `writeMulti` put a group of chunks (up to 98,
+  under 4 MB) in one transaction, each at the next free position on the
+  condition that it is free, and on the condition that the stream is not
+  closed. Positions are dense and unique, as event positions are, and a
+  group lands whole and contiguous even with several writers. A writer
+  that loses the race reads the tail again and retries. A write to a
+  closed stream is dropped, as world-postgres' readers ignore what follows
+  the first EOF. In one World instance, the writes and closes of a stream
+  run in the order they were called.
+- **Close.** Puts `CLOSED` with the chunk count, on the condition that the
+  next position is still free; closing again does nothing.
+- **Reads.** `get(runId, name, startIndex?)` returns a `ReadableStream`
+  that queries for new chunks every `streamPollIntervalMs` (250 ms by
+  default) until it has delivered every chunk before `CLOSED`. A positive
+  `startIndex` skips that many chunks; a negative one counts back from the
+  end of the stream as it is when `get()` is called. Cancelling the reader
+  aborts its query and its wait, and `close()` of the World fails the
+  readers still open, so no timer is left behind. `getChunks` pages with
+  an opaque cursor (100 chunks by default, at most 1000), `getInfo` gives
+  the last index and whether the stream is closed, and `list` the names of
+  a run's streams (`STREAMS#<runId>`).
+- **Cost.** Each live reader makes one strongly consistent query per poll
+  interval (half a read unit when nothing is new), and each write one
+  transaction. A larger interval trades latency for cost. DynamoDB Streams
+  could replace polling later.
+- `createWriteSession` is not implemented (world-postgres does not either):
+  the runtime uses the stateless `write`, `writeMulti` and `close`.
+  `@workflow/world` 5.2.0 has no stream capability to declare.
+
+## S3
+
+With a bucket (`bucket` / `WORKFLOW_AWS_BUCKET`), what does not fit
+DynamoDB or SQS goes to S3:
+
+- **Item values.** When an item would be over 350 KB, or a transaction over
+  4 MB, its largest values (never keys, counters or attributes a condition
+  reads) are written to
+  `s3://<bucket>/<runId>/<kind>/<id>/<attribute>-<sha256>` (`kind` is
+  `run`, `event`, `step`, `hook`, `wait`, `snapshot` or `stream`), and the
+  item keeps a reference `{ s3Ref, s3Encoding, s3Bytes }` instead. Reads
+  resolve it transparently, so `runs.get`, `steps.get`, `events.list`,
+  `hooks.get`, snapshots and stream reads return the same data as before.
+  Binaries are stored as they are; other values as JSON. Objects are named
+  by their content and never change, so a retried write reuses its object
+  and reads cache them (32 MiB per World). A World without a bucket still
+  reads references written by one that had it.
+- **Queue messages.** A message over 256 KiB is written whole to
+  `s3://<bucket>/queue/<runId>/<messageId>/<ulid>-<sha256>`, and its SQS
+  body carries only its ids and the reference. The worker reads it back
+  before delivering. Each SQS message has its own object, deleted right
+  after the message.
+- **Retention.** Objects of a run stay as long as the run (its DynamoDB
+  items are kept too); a VM snapshot's object is deleted when the snapshot
+  is replaced. Objects of queue messages that failed for good (moved to the
+  dead-letter queue) or of writes that never committed are left behind, so
+  give the bucket a lifecycle rule: for example expire `queue/` after 15
+  days (the queues keep messages 14), and, if runs are deleted or expired
+  by other means, expire the rest accordingly.
 
 ## Queue
 
@@ -223,12 +297,13 @@ uses `maxReceiveCount: 73` (world-postgres' job attempts) and 14 days of
 retention, so a failing delivery is retried for days and the runtime's own
 delivery cap (49) comes first; with 5 receives a message would reach the
 dead-letter queue after about a minute and a half of failures. A message
-must fit the queue's `MaximumMessageSize` (at most 1 MiB, 256 KiB on many
-queues): a larger payload fails the send until S3 offload (M3).
+over 256 KiB (the `MaximumMessageSize` every queue accepts) travels
+through S3 (see [S3](#s3)); without a bucket its send fails with
+`PayloadTooLargeError`.
 
 ## IAM
 
-The smallest policy the World needs so far (the bucket comes with M3):
+The smallest policy the World needs:
 
 ```json
 {
@@ -262,6 +337,11 @@ The smallest policy the World needs so far (the bucket comes with M3):
         "arn:aws:sqs:<region>:<account>:<workflow-queue>",
         "arn:aws:sqs:<region>:<account>:<step-queue>"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<bucket>/*"
     }
   ]
 }
@@ -271,7 +351,9 @@ The smallest policy the World needs so far (the bucket comes with M3):
 `SendMessageBatch` by `sqs:SendMessage`. The dead-letter queues need no
 permission for the World: SQS moves messages there itself. A process that
 only starts runs and never calls `start()` needs no `sqs:ReceiveMessage`,
-`sqs:DeleteMessage` or `sqs:ChangeMessageVisibility`.
+`sqs:DeleteMessage` or `sqs:ChangeMessageVisibility`. Without a bucket the
+S3 statement can go, unless a World with one wrote references earlier
+(reads then need `s3:GetObject`).
 
 ## Development
 
@@ -295,7 +377,12 @@ moto the storage suites send their DynamoDB requests one at a time (see
 the emulator's SQS, and the `@workflow/world-testing` suite runs at spec 8
 and spec 9 against the World bundled with tsup, each test starting its own
 app server with its own table and queues (those servers do send requests
-concurrently, moto included); its stream tests are skipped until M3:
+concurrently, moto included), streams included. The stream suites of
+world-postgres and world-local are ported too, and large payloads and
+queue messages round-trip through the emulator's S3. Set
+`WORKFLOW_AWS_EMULATOR` (`moto`, `localstack` or `aws`) to say which
+emulator answers; otherwise the setup tells moto (a Werkzeug server that
+is not LocalStack) from the rest:
 
 ```bash
 WORKFLOW_AWS_ENDPOINT=http://localhost:4566 pnpm test:integration
@@ -312,7 +399,7 @@ WORKFLOW_AWS_ENDPOINT=http://localhost:4566 pnpm bootstrap:local
 - M0: scaffold, config, key layout, local bootstrap, CI
 - M1: storage (runs, events, steps, hooks, waits, snapshots) — done
 - M2: SQS queue (worker mode, long delays, idempotency, DLQ) — done
-- M3: streams, S3 offload, full `@workflow/world-testing` suite
+- M3: streams, S3 offload, full `@workflow/world-testing` suite — done
 - M4: docs, IAM policy, example, Lambda mode, first release
 
 ## License
