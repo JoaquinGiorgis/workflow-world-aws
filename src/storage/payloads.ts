@@ -2,7 +2,8 @@
  * Payloads too large for a DynamoDB item, kept in S3.
  *
  * An attribute that does not fit is written to
- * `s3://<bucket>/<runId>/<kind>/<id>/<attribute>-<digest>` and the item
+ * `s3://<bucket>/<runId>/<kind>/<id>/<attribute>-<digest>` (a stream
+ * chunk's `<id>` is `<name>/<position>`) and the item
  * keeps a reference in its place: `{ s3Ref, s3Encoding, s3Bytes }`. Reads
  * put the value back, so every caller sees the item as it was written.
  *
@@ -122,12 +123,17 @@ export function objectKeyPrefix(item: Item, attribute: string): string {
       id = sk;
     }
   } else if (pk.startsWith(PREFIX.stream)) {
-    // STREAM#<runId>#<name>: run ids have no '#'.
+    // STREAM#<runId>#<name>: run ids have no '#'. One segment for the
+    // stream and one for the chunk's position, so a listing or a lifecycle
+    // rule can take a single stream.
     const rest = pk.slice(PREFIX.stream.length);
     const at = rest.indexOf('#');
     runId = rest.slice(0, at);
-    kind = 'stream';
-    id = `${rest.slice(at + 1)}/${sk}`;
+    const name = segment(rest.slice(at + 1));
+    const position = sk.startsWith(PREFIX.chunk)
+      ? sk.slice(PREFIX.chunk.length)
+      : sk;
+    return `${segment(runId)}/stream/${name}/${segment(position)}/${segment(attribute)}`;
   }
   return `${segment(runId)}/${kind}/${segment(id)}/${segment(attribute)}`;
 }

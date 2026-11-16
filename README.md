@@ -197,7 +197,8 @@ DynamoDB or SQS goes to S3:
   expressions), its largest values (never keys, counters or attributes a condition
   reads) are written to
   `s3://<bucket>/<runId>/<kind>/<id>/<attribute>-<sha256>` (`kind` is
-  `run`, `event`, `step`, `hook`, `wait`, `snapshot` or `stream`), and the
+  `run`, `event`, `step`, `hook`, `wait`, `snapshot` or `stream`; a stream
+  chunk's `<id>` is `<stream name>/<position>`), and the
   item keeps a reference `{ s3Ref, s3Encoding, s3Bytes }` instead. Reads
   resolve it transparently, so `runs.get`, `steps.get`, `events.list`,
   `hooks.get`, snapshots and stream reads return the same data as before.
