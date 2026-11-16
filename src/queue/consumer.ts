@@ -50,6 +50,7 @@ import {
   singleOrchestratorRunIdOf,
   type ValidQueueName,
 } from '@workflow/world';
+import { debugLog } from '../storage/log.js';
 import type { PayloadStore, S3Ref } from '../storage/payloads.js';
 import { sleep } from '../storage/table.js';
 import type { Delivery, DeliveryResult } from './delivery.js';
@@ -339,6 +340,10 @@ export class Consumer {
       message.notBefore !== undefined &&
       message.notBefore - Date.now() > EARLY_DELIVERY_TOLERANCE_MS
     ) {
+      debugLog('queue message sent on toward its notBefore', {
+        ...traceOf(message),
+        notBefore: new Date(message.notBefore).toISOString(),
+      });
       await sendQueueMessage(
         this.options.sqs,
         queueUrl,
@@ -355,6 +360,9 @@ export class Consumer {
     // landing after it would reset the visibility it set.
     const stopHeartbeat = this.heartbeat(queueUrl, receipt);
     const gateKey = runGateKey(message);
+    if (gateKey && this.options.runGate.isHeld(gateKey)) {
+      debugLog('queue delivery waits for its run', traceOf(message));
+    }
     const release = gateKey
       ? await this.options.runGate.acquire(gateKey)
       : undefined;
@@ -367,6 +375,8 @@ export class Consumer {
       }
       const attempt = receiveCount + (message.attemptOffset ?? 0);
       const deliveryCount = receiveCount + (message.deliveryOffset ?? 0);
+      const trace = { ...traceOf(message), attempt, deliveryCount };
+      debugLog('queue delivery started', trace);
       let result: DeliveryResult;
       try {
         result = await this.options.deliver({
@@ -379,14 +389,22 @@ export class Consumer {
       } catch (error) {
         result = { type: 'error', status: 0, text: describe(error) };
       }
-      if (this.abandoned) return;
+      if (this.abandoned) {
+        debugLog('queue delivery abandoned at close', trace);
+        return;
+      }
 
       switch (result.type) {
         case 'completed':
+          debugLog('queue delivery completed', trace);
           await stopHeartbeat();
           await this.acknowledge(queueUrl, receipt, bodyRef);
           return;
         case 'reschedule':
+          debugLog('queue delivery rescheduled', {
+            ...trace,
+            timeoutSeconds: result.timeoutSeconds,
+          });
           await sendQueueMessage(
             this.options.sqs,
             queueUrl,
@@ -552,6 +570,20 @@ export function followUp(
     ...rest,
     ...(attemptOffset !== undefined && { attemptOffset }),
     deliveryOffset: deliveryCount,
+  };
+}
+
+/** What the DEBUG trace says about a message. */
+function traceOf(message: QueueMessage): Record<string, unknown> {
+  const payload = (message.payload ?? {}) as {
+    runId?: unknown;
+    stepId?: unknown;
+  };
+  return {
+    queueName: message.queueName,
+    messageId: message.messageId,
+    ...(typeof payload.runId === 'string' && { runId: payload.runId }),
+    ...(typeof payload.stepId === 'string' && { stepId: payload.stepId }),
   };
 }
 

@@ -81,6 +81,11 @@ export class RunGate {
     };
   }
 
+  /** Whether `key` has a holder now (an `acquire` of it would wait). */
+  isHeld(key: string): boolean {
+    return this.tails.has(key);
+  }
+
   /** Keys with a holder or a waiter; for tests. */
   get size(): number {
     return this.tails.size;

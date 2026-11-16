@@ -126,6 +126,41 @@ describe('the worker', () => {
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
+  it('traces every delivery outcome under DEBUG, reschedules included', async () => {
+    vi.stubEnv('DEBUG', 'workflow:world-aws');
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    try {
+      const handler = vi.fn(async () => ({ timeoutSeconds: 7 }));
+      const { queue, options } = await worker(handler);
+      const message = sqsMessage(
+        {
+          messageId: 'msg_01JD0000000000000000000DBG' as never,
+          payload: { runId: 'wrun_A', runSpecVersion: 9 },
+        },
+        2
+      );
+      serveMessages(mocks, options.workflowQueueUrl, [message]);
+      await queue.startWorker();
+
+      await vi.waitFor(() =>
+        expect(deleted()).toEqual([message.ReceiptHandle])
+      );
+      expect(debug).toHaveBeenCalledWith(
+        '[world-aws] queue delivery rescheduled',
+        expect.objectContaining({
+          messageId: 'msg_01JD0000000000000000000DBG',
+          runId: 'wrun_A',
+          attempt: 2,
+          deliveryCount: 2,
+          timeoutSeconds: 7,
+        })
+      );
+    } finally {
+      debug.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('counts attempts across redeliveries as world-postgres does', () => {
     const base = {
       v: 1 as const,
