@@ -396,6 +396,29 @@ describe('createSqsLambdaHandler', () => {
     }
   );
 
+  it('sends its warnings to the logger it was given', async () => {
+    ddb
+      .on(QueryCommand)
+      .rejectsOnce(new Error('throttled'))
+      .resolves({ Items: [] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const log = vi.fn();
+    try {
+      const lambda = createSqsLambdaHandler({
+        world: world(async () => undefined),
+        log,
+      });
+      await lambda(event(record({ payload: { runId: 'wrun_A' } })));
+      expect(log).toHaveBeenCalledWith(
+        'Could not recover the runs that have not ended; trying again on the next event',
+        { error: 'throttled' }
+      );
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('tries recovery again on the next event after a throttled query', async () => {
     ddb
       .on(QueryCommand)

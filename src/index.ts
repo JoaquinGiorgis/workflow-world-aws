@@ -15,7 +15,7 @@ import {
   type RetryOptions,
   STORAGE_CAPABILITIES,
 } from './storage/index.js';
-import { debugLog } from './storage/log.js';
+import { debugLog, type WarnLog, warnLog } from './storage/log.js';
 import { PayloadStore } from './storage/payloads.js';
 import { Table } from './storage/table.js';
 import { createStreamer } from './streams/index.js';
@@ -212,6 +212,8 @@ export interface SqsLambdaHandlerOptions {
    * whose next message was lost.
    */
   recover?: boolean;
+  /** @internal Test hook: where warnings go. Default `console.warn`. */
+  log?: WarnLog;
 }
 
 /**
@@ -235,6 +237,7 @@ export interface SqsLambdaHandlerOptions {
 export function createSqsLambdaHandler(
   options: SqsLambdaHandlerOptions = {}
 ): (event: SqsLambdaEvent, context?: unknown) => Promise<SqsBatchResponse> {
+  const log = options.log ?? warnLog;
   let world: Promise<AwsWorld> | undefined;
   let recovered = options.recover === false;
 
@@ -250,13 +253,13 @@ export function createSqsLambdaHandler(
       if (isPermanentFailure(error)) {
         // Every event would fail the same way; a new process tries again.
         recovered = true;
-        console.warn(
-          '[world-aws] Could not recover the runs that have not ended; not trying again in this process',
+        log(
+          'Could not recover the runs that have not ended; not trying again in this process',
           detail
         );
       } else {
-        console.warn(
-          '[world-aws] Could not recover the runs that have not ended; trying again on the next event',
+        log(
+          'Could not recover the runs that have not ended; trying again on the next event',
           detail
         );
       }

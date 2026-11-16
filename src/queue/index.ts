@@ -37,6 +37,7 @@ import {
   destroyNodeHttpAgents,
 } from '@workflow/world/node-http.js';
 import { PayloadBucketError, PayloadTooLargeError } from '../storage/errors.js';
+import { warnLog } from '../storage/log.js';
 import type { PayloadStore } from '../storage/payloads.js';
 import {
   Consumer,
@@ -146,12 +147,7 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
   const shared: SharedQueues = sharedQueues(
     [options.endpoint ?? '', workflowQueueUrl, stepQueueUrl].join('|')
   );
-  const log =
-    options.internal?.log ??
-    ((message: string, detail?: Record<string, unknown>) =>
-      detail === undefined
-        ? console.warn(`[world-aws] ${message}`)
-        : console.warn(`[world-aws] ${message}`, detail));
+  const log = options.internal?.log ?? warnLog;
   const idempotency = new IdempotencyStore(
     options.documents,
     options.tableName,

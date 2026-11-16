@@ -1,3 +1,15 @@
+/** Where the World reports what an operator should see. */
+export type WarnLog = (
+  message: string,
+  detail?: Record<string, unknown>
+) => void;
+
+/** The default {@link WarnLog}: `console.warn`, prefixed `[world-aws]`. */
+export const warnLog: WarnLog = (message, detail) => {
+  if (detail === undefined) console.warn(`[world-aws] ${message}`);
+  else console.warn(`[world-aws] ${message}`, detail);
+};
+
 /**
  * A diagnostic line, only under `DEBUG=workflow:*` (or `DEBUG=*`), the gate
  * `@workflow/utils`' `debugLog` uses for the other Worlds.
