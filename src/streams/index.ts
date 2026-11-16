@@ -48,6 +48,7 @@ import {
   streamNamesPk,
   streamPk,
 } from '../keys.js';
+import { isLostRace } from '../storage/commit.js';
 import { MAX_ITEM_BYTES, MAX_TRANSACTION_BYTES } from '../storage/errors.js';
 import type { Item } from '../storage/items.js';
 import { debugLog } from '../storage/log.js';
@@ -95,15 +96,6 @@ function toBytes(chunk: string | Uint8Array): Uint8Array {
   return typeof chunk === 'string' ? encoder.encode(chunk) : chunk;
 }
 
-/** Whether `error` is a cancelled transaction (a condition failed). */
-function isCancelled(error: unknown): boolean {
-  const name = (error as { name?: string } | undefined)?.name;
-  return (
-    name === 'TransactionCanceledException' ||
-    name === 'TransactionConflictException'
-  );
-}
-
 interface Chunk {
   seq: number;
   data: Uint8Array;
@@ -140,7 +132,12 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
   const maxAttempts = options.maxAttempts ?? 50;
   const offloads = table.payloads?.enabled === true;
 
-  /** Per stream name, the tail of this instance's writes and closes. */
+  /**
+   * Per stream name, the run id of this instance's latest write or close,
+   * once it and every earlier one of the name have resolved.
+   */
+  const resolving = new Map<string, Promise<void>>();
+  /** Per stream (partition key), the tail of this instance's writes and closes. */
   const chains = new Map<string, Promise<void>>();
   /** Per stream, the next free sequence number as this instance saw it. */
   const tails = new Map<string, number>();
@@ -153,18 +150,44 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
   const closedError = () =>
     new Error('Cannot read stream: the AWS World has been closed');
 
-  /** Runs `task` after every earlier write or close of `name`. */
-  const inOrder = (name: string, task: () => Promise<void>) => {
-    const previous = chains.get(name) ?? Promise.resolve();
-    const run = previous.then(task);
-    const settled = run.then(
+  /** Appends `promise`, settled, to `map`'s chain at `key`, and forgets it. */
+  const settle = (
+    map: Map<string, Promise<void>>,
+    key: string,
+    promise: Promise<unknown>
+  ) => {
+    const settled = promise.then(
       () => {},
       () => {}
     );
-    chains.set(name, settled);
+    map.set(key, settled);
     void settled.then(() => {
-      if (chains.get(name) === settled) chains.delete(name);
+      if (map.get(key) === settled) map.delete(key);
     });
+  };
+
+  /**
+   * Runs `task` after every earlier write or close of the same stream. Run
+   * ids are resolved in call order per name (one may be a promise), and the
+   * writes then wait only for those of the same run: same-named streams of
+   * other runs do not hold each other back.
+   */
+  const inOrder = (
+    runId: string | Promise<string>,
+    name: string,
+    task: (runId: string) => Promise<void>
+  ): Promise<void> => {
+    const previous = resolving.get(name) ?? Promise.resolve();
+    const resolved = previous.then(() => runId);
+    const run = resolved.then((id) => {
+      const pk = streamPk(id, name);
+      const done = (chains.get(pk) ?? Promise.resolve()).then(() => task(id));
+      settle(chains, pk, done);
+      return done;
+    });
+    // After `run`'s reaction, so a stream's writes join its chain in call
+    // order.
+    settle(resolving, name, resolved);
     return run;
   };
 
@@ -278,7 +301,7 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
         try {
           await table.transact(items);
         } catch (error) {
-          if (!isCancelled(error)) throw error;
+          if (!isLostRace(error)) throw error;
           tails.delete(pk);
           if ((await readClosed(runId, name)) !== undefined) {
             dropped = true;
@@ -327,7 +350,7 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
           nameItem(runId, name),
         ]);
       } catch (error) {
-        if (!isCancelled(error)) throw error;
+        if (!isLostRace(error)) throw error;
         tails.delete(pk);
         // Closed already: closing again does nothing.
         return (await readClosed(runId, name)) === undefined ? 'retry' : 'done';
@@ -353,21 +376,20 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
   return {
     streams: {
       write(runId, name, chunk) {
-        return inOrder(name, async () =>
-          writeChunks(await runId, name, [toBytes(chunk)])
+        return inOrder(runId, name, (id) =>
+          writeChunks(id, name, [toBytes(chunk)])
         );
       },
 
       writeMulti(runId, name, chunks) {
-        return inOrder(name, async () => {
-          const resolved = await runId;
+        return inOrder(runId, name, async (id) => {
           if (chunks.length === 0) return;
-          await writeChunks(resolved, name, chunks.map(toBytes));
+          await writeChunks(id, name, chunks.map(toBytes));
         });
       },
 
       close(runId, name) {
-        return inOrder(name, async () => closeStream(await runId, name));
+        return inOrder(runId, name, (id) => closeStream(id, name));
       },
 
       async get(runId, name, startIndex) {
@@ -378,6 +400,8 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
           // Against the stream as it is now, as world-local resolves it.
           const { tailIndex } = await getInfo(runId, name);
           next = Math.max(0, tailIndex + 1 + next);
+          // The World may have closed meanwhile: no reader may outlive it.
+          if (closed) throw closedError();
         }
         const abort = new AbortController();
         let controller!: ReadableStreamDefaultController<Uint8Array>;
@@ -511,6 +535,7 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
     async close() {
       closed = true;
       for (const stop of [...readers]) stop(closedError());
+      await Promise.allSettled([...resolving.values()]);
       await Promise.allSettled([...chains.values()]);
     },
   };

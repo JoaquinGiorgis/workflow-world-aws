@@ -209,14 +209,7 @@ export async function commit<R>(
           offloaded: table.payloads?.enabled === true,
         });
       }
-      // No reasons at all: an emulator that does not report them. Deciding
-      // again is always safe; a permanent error then exhausts the attempts.
-      if (
-        reasons.size > 0 &&
-        ![...reasons].some((reason) => RETRYABLE_REASONS.has(reason))
-      ) {
-        throw error;
-      }
+      if (!isLostRace(error)) throw error;
       const next: Failure = { reasons: new Map() };
       for (const [index, entry] of tagged.entries()) {
         const reason = reasonAt(error, index);
@@ -391,6 +384,23 @@ function withActiveRunIndex(append: Append): Pick<Append, 'set' | 'remove'> {
  * error. A conflict with another transaction in flight surfaces as
  * `TransactionConflictException` on some emulators; it is retryable too.
  */
+/**
+ * Whether a write failed because another writer got there first, so
+ * deciding again (on fresh reads) may succeed: a cancelled transaction
+ * whose reasons include a failed condition or a conflict. A cancellation
+ * with no reasons at all comes from an emulator that does not report them;
+ * retrying it is always safe, and a permanent error then exhausts the
+ * attempts.
+ */
+export function isLostRace(error: unknown): boolean {
+  const reasons = cancellationReasons(error);
+  if (reasons === undefined) return false;
+  return (
+    reasons.size === 0 ||
+    [...reasons].some((reason) => RETRYABLE_REASONS.has(reason))
+  );
+}
+
 function cancellationReasons(error: unknown): Set<string> | undefined {
   const name = (error as { name?: string } | undefined)?.name;
   if (name === 'TransactionConflictException') {
