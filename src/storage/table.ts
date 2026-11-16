@@ -16,6 +16,7 @@ import {
   MAX_TRANSACTION_BYTES,
   MissingTableIndexError,
   PayloadTooLargeError,
+  TRANSACTION_MARGIN_BYTES,
 } from './errors.js';
 import type { Item } from './items.js';
 import { debugLog } from './log.js';
@@ -23,6 +24,7 @@ import {
   isS3Ref,
   objectKeyPrefix,
   type PayloadStore,
+  type PutOptions,
   type S3Ref,
   storedForm,
 } from './payloads.js';
@@ -167,10 +169,14 @@ export class Table {
 
   /**
    * Writes `item` whole. Objects in S3 that the item it replaced (or this
-   * one) referenced and this one no longer does are deleted.
+   * one) referenced and this one no longer does are deleted; so the values
+   * it moves to S3 get objects of their own (`unique`), which no other
+   * write shares.
    */
   async put(item: Item): Promise<void> {
-    const [entry] = await this.prepare([{ Put: { Item: item } }]);
+    const [entry] = await this.prepare([{ Put: { Item: item } }], {
+      unique: true,
+    });
     const stored = (entry as { Put: { Item: Item } }).Put.Item;
     const result = await this.documents.send(
       new PutCommand({
@@ -239,8 +245,15 @@ export class Table {
     return items.slice(0, want);
   }
 
-  async transact(items: TransactItem[]): Promise<void> {
-    const prepared = await this.prepare(items);
+  /**
+   * One transaction. `uploaded` is shared by the attempts of one write, so
+   * a retry does not upload its values to S3 again (see `PutOptions`).
+   */
+  async transact(
+    items: TransactItem[],
+    options: Pick<PutOptions, 'uploaded'> = {}
+  ): Promise<void> {
+    const prepared = await this.prepare(items, options);
     await this.documents.send(
       new TransactWriteCommand({
         TransactItems: prepared.map((entry) =>
@@ -266,13 +279,18 @@ export class Table {
   /**
    * The writes as they are sent: every item in its stored form, with the
    * values that keep an item over {@link MAX_ITEM_BYTES}, or the
-   * transaction over {@link MAX_TRANSACTION_BYTES}, written to S3 (largest
-   * first) and referenced instead.
+   * transaction over {@link MAX_TRANSACTION_BYTES} less
+   * {@link TRANSACTION_MARGIN_BYTES}, written to S3 (largest first) and
+   * referenced instead. Without a bucket, a transaction within the margin
+   * is sent as it is, for DynamoDB to decide.
    *
    * @throws {PayloadTooLargeError} when that is not possible: no bucket, or
    *   what is left does not fit either.
    */
-  private async prepare(items: TransactItem[]): Promise<object[]> {
+  private async prepare(
+    items: TransactItem[],
+    options: PutOptions = {}
+  ): Promise<object[]> {
     const out: object[] = [];
     const pending: Pending[] = [];
     for (const entry of items) {
@@ -344,22 +362,23 @@ export class Table {
             offloaded: this.payloads?.enabled === true,
           });
         }
-        await this.offload(each, attribute);
+        await this.offload(each, attribute, options);
         size = sizeOf(each.item);
       }
     }
 
     const total = () => pending.reduce((sum, each) => sum + each.bytes(), 0);
     let bytes = total();
-    while (bytes > MAX_TRANSACTION_BYTES) {
+    while (bytes > MAX_TRANSACTION_BYTES - TRANSACTION_MARGIN_BYTES) {
       const largest = this.largestOffloadable(pending);
       if (largest === undefined || !this.payloads?.enabled) {
+        if (bytes <= MAX_TRANSACTION_BYTES) break;
         throw new PayloadTooLargeError('The transaction', bytes, {
           limit: MAX_TRANSACTION_BYTES,
           offloaded: this.payloads?.enabled === true,
         });
       }
-      await this.offload(largest.pending, largest.attribute);
+      await this.offload(largest.pending, largest.attribute, options);
       bytes = total();
     }
     return out;
@@ -381,11 +400,16 @@ export class Table {
     return best;
   }
 
-  private async offload(each: Pending, attribute: string): Promise<void> {
+  private async offload(
+    each: Pending,
+    attribute: string,
+    options: PutOptions
+  ): Promise<void> {
     const payloads = this.payloads as PayloadStore;
     const ref = await payloads.put(
       objectKeyPrefix(each.item, attribute),
-      each.item[attribute]
+      each.item[attribute],
+      options
     );
     each.replace(attribute, ref);
   }

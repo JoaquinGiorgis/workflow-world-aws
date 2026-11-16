@@ -15,6 +15,33 @@ export const DYNAMODB_ITEM_BYTES = 400 * 1024;
 /** DynamoDB's limit for one TransactWriteItems request. */
 export const MAX_TRANSACTION_BYTES = 4 * 1024 * 1024;
 
+/**
+ * What the World keeps free below {@link MAX_TRANSACTION_BYTES} for what
+ * DynamoDB counts besides the item values: keys, attribute names and
+ * expressions.
+ */
+export const TRANSACTION_MARGIN_BYTES = 256 * 1024;
+
+/** `WorkflowWorldError.code` of {@link PayloadBucketError}. */
+export const PAYLOAD_BUCKET_NOT_FOUND_CODE = 'PAYLOAD_BUCKET_NOT_FOUND';
+
+/**
+ * The S3 bucket the World is configured to store large payloads in does
+ * not exist. Nothing is written.
+ */
+export class PayloadBucketError extends WorkflowWorldError {
+  readonly bucket: string;
+
+  constructor(bucket: string, cause: unknown) {
+    super(
+      `The S3 bucket "${bucket}" does not exist. The AWS World stores payloads too large for DynamoDB or SQS there; it is set with the \`bucket\` option of createWorld() or the WORKFLOW_AWS_BUCKET environment variable. Create the bucket, or point the setting at one that exists.`,
+      { status: 500, code: PAYLOAD_BUCKET_NOT_FOUND_CODE, cause }
+    );
+    this.name = 'PayloadBucketError';
+    this.bucket = bucket;
+  }
+}
+
 /** `WorkflowWorldError.code` of {@link MissingTableIndexError}. */
 export const MISSING_TABLE_INDEX_CODE = 'MISSING_TABLE_INDEX';
 

@@ -55,6 +55,8 @@ export {
   MAX_ITEM_BYTES,
   MISSING_TABLE_INDEX_CODE,
   MissingTableIndexError,
+  PAYLOAD_BUCKET_NOT_FOUND_CODE,
   PAYLOAD_TOO_LARGE_CODE,
+  PayloadBucketError,
   PayloadTooLargeError,
 } from './errors.js';

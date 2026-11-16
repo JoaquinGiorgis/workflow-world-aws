@@ -49,7 +49,11 @@ import {
   streamPk,
 } from '../keys.js';
 import { isLostRace } from '../storage/commit.js';
-import { MAX_ITEM_BYTES, MAX_TRANSACTION_BYTES } from '../storage/errors.js';
+import {
+  MAX_ITEM_BYTES,
+  MAX_TRANSACTION_BYTES,
+  TRANSACTION_MARGIN_BYTES,
+} from '../storage/errors.js';
 import type { Item } from '../storage/items.js';
 import { debugLog } from '../storage/log.js';
 import {
@@ -78,7 +82,7 @@ export type AwsStreamer = Streamer & {
 /** Chunks per transaction: two items are the closed check and the name. */
 const MAX_GROUP_CHUNKS = MAX_TRANSACTION_ITEMS - 2;
 /** Bytes per transaction, below DynamoDB's 4 MB. */
-const MAX_GROUP_BYTES = MAX_TRANSACTION_BYTES - 256 * 1024;
+const MAX_GROUP_BYTES = MAX_TRANSACTION_BYTES - TRANSACTION_MARGIN_BYTES;
 /** What a chunk item adds besides its data. */
 const CHUNK_OVERHEAD_BYTES = 256;
 /** What a chunk moved to S3 leaves in its item. */
@@ -273,6 +277,8 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
     const pk = streamPk(runId, name);
     for (const group of groupsOf(chunks)) {
       let dropped = false;
+      /** Chunks of the group moved to S3: retries reuse their objects. */
+      const uploaded = new Set<string>();
       await withRetries(`write to stream "${name}"`, async () => {
         const next = tails.get(pk) ?? (await readTail(pk));
         const items: TransactItem[] = [
@@ -299,7 +305,7 @@ export function createStreamer(options: StreamerOptions): AwsStreamer {
           ...(named.has(pk) ? [] : [nameItem(runId, name)]),
         ];
         try {
-          await table.transact(items);
+          await table.transact(items, { uploaded });
         } catch (error) {
           if (!isLostRace(error)) throw error;
           tails.delete(pk);

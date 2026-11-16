@@ -34,7 +34,7 @@ import {
   createNodeHttpAgents,
   destroyNodeHttpAgents,
 } from '@workflow/world/node-http.js';
-import { PayloadTooLargeError } from '../storage/errors.js';
+import { PayloadBucketError, PayloadTooLargeError } from '../storage/errors.js';
 import type { PayloadStore } from '../storage/payloads.js';
 import {
   Consumer,
@@ -265,7 +265,10 @@ export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
           results[index] = {
             messageId: null,
             error: describe(error),
-            retryable: !(error instanceof PayloadTooLargeError),
+            retryable: !(
+              error instanceof PayloadTooLargeError ||
+              error instanceof PayloadBucketError
+            ),
           };
           if (reserved) {
             await idempotency.release(reserved.key, messageId, reserved.at);

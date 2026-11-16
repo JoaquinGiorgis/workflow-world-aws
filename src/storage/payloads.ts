@@ -11,8 +11,10 @@
  *   is what DynamoDB would have returned: the World only stores values it
  *   has already made storable (dates as ISO strings).
  * - Object keys carry the SHA-256 of the content, so a write retried after
- *   a lost race (or a value written again unchanged) maps to the same
- *   object, and an object never changes once written: reads cache them.
+ *   a lost race maps to the same object (and uploads it once), and an
+ *   object never changes once written: reads cache them. An item whose
+ *   replaced version's objects are deleted (a snapshot) gets keys of its
+ *   own, so no other save shares, and loses, its object.
  * - A resolved item remembers the reference of each value it resolved
  *   ({@link RESOLVED}), so writing it back, or measuring it, uses the
  *   reference again instead of a second copy of the bytes.
@@ -26,7 +28,9 @@ import {
 } from '@aws-sdk/client-s3';
 import { WorkflowWorldError } from '@workflow/errors';
 import { PREFIX } from '../keys.js';
+import { nextUlid } from '../queue/state.js';
 import { deserializePayload, serializePayload } from '../queue/transport.js';
+import { PayloadBucketError } from './errors.js';
 import type { Item } from './items.js';
 
 /** What an item holds in place of a value kept in S3. */
@@ -147,14 +151,21 @@ export interface PayloadStoreOptions {
   cacheBytes?: number;
 }
 
-/** How many recently written object keys are remembered. */
-const RECENT_WRITES = 1_024;
-/**
- * How long a written key is trusted to still exist, so a write retried
- * after a lost race does not upload the same bytes again. Short: another
- * process may delete the object (a snapshot it replaced) at any time.
- */
-const RECENT_WRITE_MS = 30_000;
+export interface PutOptions {
+  /**
+   * Keys uploaded already by the write this put is part of (the attempts
+   * of one commit): one of them is not uploaded again. Scoped to the write
+   * on purpose: an object may be deleted by another process at any time
+   * after it, if it belonged to a replaced snapshot.
+   */
+  uploaded?: Set<string>;
+  /**
+   * Gives the object a key of its own (a ULID after the digest), for an
+   * item whose replaced version's objects are deleted: an object is then
+   * never shared with another save of equal content.
+   */
+  unique?: boolean;
+}
 
 /** Reads and writes payloads in S3; see the module comment. */
 export class PayloadStore {
@@ -163,8 +174,6 @@ export class PayloadStore {
   private readonly cacheBytes: number;
   private readonly cache = new Map<string, Uint8Array>();
   private cached = 0;
-  /** Recently written keys, with when. */
-  private readonly written = new Map<string, number>();
 
   constructor(options: PayloadStoreOptions) {
     this.s3 = options.s3;
@@ -180,9 +189,14 @@ export class PayloadStore {
   /**
    * Writes `value` under `keyPrefix` and returns its reference.
    *
-   * @throws when no bucket is configured.
+   * @throws when no bucket is configured, and {@link PayloadBucketError}
+   *   when the configured one does not exist.
    */
-  async put(keyPrefix: string, value: unknown): Promise<S3Ref> {
+  async put(
+    keyPrefix: string,
+    value: unknown,
+    options: PutOptions = {}
+  ): Promise<S3Ref> {
     const bucket = this.bucket;
     if (bucket === undefined) {
       throw new Error('PayloadStore.put needs a bucket');
@@ -192,18 +206,26 @@ export class PayloadStore {
       ? value
       : new TextEncoder().encode(serializePayload(value));
     const digest = createHash('sha256').update(body).digest('hex');
-    const key = `${keyPrefix}-${digest.slice(0, 40)}`;
-    const writtenAt = this.written.get(key);
-    if (writtenAt === undefined || Date.now() - writtenAt > RECENT_WRITE_MS) {
-      await this.s3.send(
-        new PutObjectCommand({
-          Bucket: bucket,
-          Key: key,
-          Body: body,
-          ContentType: binary ? 'application/octet-stream' : 'application/json',
-        })
-      );
-      this.remember(key);
+    const key = `${keyPrefix}-${digest.slice(0, 40)}${options.unique ? `-${nextUlid()}` : ''}`;
+    if (!options.uploaded?.has(key)) {
+      try {
+        await this.s3.send(
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: body,
+            ContentType: binary
+              ? 'application/octet-stream'
+              : 'application/json',
+          })
+        );
+      } catch (error) {
+        if ((error as { name?: string } | undefined)?.name === 'NoSuchBucket') {
+          throw new PayloadBucketError(bucket, error);
+        }
+        throw error;
+      }
+      options.uploaded?.add(key);
     }
     this.store(`s3://${bucket}/${key}`, body);
     return {
@@ -245,7 +267,6 @@ export class PayloadStore {
   async delete(ref: S3Ref): Promise<void> {
     const { bucket, key } = parseRef(ref.s3Ref);
     this.cache.delete(ref.s3Ref);
-    this.written.delete(key);
     await this.s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
   }
 
@@ -283,15 +304,6 @@ export class PayloadStore {
       if (this.cached <= this.cacheBytes) break;
       this.cache.delete(oldest);
       this.cached -= bytes.byteLength;
-    }
-  }
-
-  private remember(key: string): void {
-    this.written.delete(key);
-    this.written.set(key, Date.now());
-    if (this.written.size > RECENT_WRITES) {
-      const [oldest] = this.written.keys();
-      if (oldest !== undefined) this.written.delete(oldest);
     }
   }
 }

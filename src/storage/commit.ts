@@ -171,6 +171,8 @@ export async function commit<R>(
   retry: RetryOptions = DEFAULT_RETRY
 ): Promise<R> {
   let failure: Failure | undefined;
+  /** Values this write moved to S3: a retry does not upload them again. */
+  const uploaded = new Set<string>();
   for (let attempt = 0; attempt < retry.maxAttempts; attempt++) {
     if (attempt >= retry.immediateAttempts) {
       // Full jitter, so writers that keep colliding spread out.
@@ -198,7 +200,7 @@ export async function commit<R>(
     const items = [...tagged.map((entry) => entry.item), ...inline];
 
     try {
-      await table.transact(items);
+      await table.transact(items, { uploaded });
     } catch (error) {
       const reasons = cancellationReasons(error);
       if (reasons === undefined) throw error;
