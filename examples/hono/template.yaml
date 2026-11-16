@@ -4,8 +4,9 @@
 # - the workflow and step SQS queues, each with a dead-letter queue after 73
 #   receives and 14 days of retention;
 # - an S3 bucket for payloads too large for DynamoDB or SQS;
-# - the `api` function behind a function URL (starts and reads runs) and
-#   the `queue` function behind both queues' event source mappings.
+# - the `api` function behind a function URL (starts and reads runs), the
+#   `queue` function behind both queues' event source mappings, and the
+#   optional `recover` function on a schedule (see RecoverySchedule).
 #
 # Intrinsic functions are written in their long form (`Ref:`, `Fn::GetAtt:`)
 # so the file is plain YAML (scripts/template.test.mjs reads it).
@@ -15,6 +16,21 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: Workflow SDK on AWS (Hono, Lambda mode, @joaquingiorgis/world-aws)
+
+Parameters:
+  # The queue function recovers runs on the first event of each process
+  # only, so a run whose next message was lost waits for the next event
+  # while the queues are idle. This schedule recovers them anyway; an empty
+  # value leaves the function out.
+  RecoverySchedule:
+    Type: String
+    Default: rate(15 minutes)
+    Description: Schedule expression for world.recover(), or empty for none
+
+Conditions:
+  ScheduledRecovery:
+    Fn::Not:
+      - Fn::Equals: [{ Ref: RecoverySchedule }, ""]
 
 Globals:
   Function:
@@ -26,9 +42,10 @@ Globals:
     # while the first one still runs it.
     Timeout: 60
     CodeUri: .
+    # No WORKFLOW_TARGET_WORLD: the bundle could not load the package by
+    # name; src/world.ts passes the World to setWorld() instead.
     Environment:
       Variables:
-        WORKFLOW_TARGET_WORLD: "@joaquingiorgis/world-aws"
         WORKFLOW_AWS_REGION:
           Ref: AWS::Region
         WORKFLOW_AWS_TABLE:
@@ -173,15 +190,54 @@ Resources:
             Resource:
               - Fn::Sub: "${PayloadBucket.Arn}/*"
 
+  # WorldPolicy without what only a consumer of the queues does
+  # (ReceiveMessage, DeleteMessage, ChangeMessageVisibility), for the
+  # functions that send messages but run no deliveries.
+  SenderPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WorkflowTableItems
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:BatchGetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:ConditionCheckItem
+            Resource:
+              - Fn::GetAtt: [WorkflowTable, Arn]
+          - Sid: WorkflowTableQueries
+            Effect: Allow
+            Action: [dynamodb:Query]
+            Resource:
+              - Fn::GetAtt: [WorkflowTable, Arn]
+              - Fn::Sub: "${WorkflowTable.Arn}/index/*"
+          - Sid: WorkflowQueues
+            Effect: Allow
+            Action: [sqs:SendMessage]
+            Resource:
+              - Fn::GetAtt: [WorkflowQueue, Arn]
+              - Fn::GetAtt: [StepQueue, Arn]
+          - Sid: WorkflowPayloads
+            Effect: Allow
+            Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+            Resource:
+              - Fn::Sub: "${PayloadBucket.Arn}/*"
+
   # Starts runs and reads them back. AWS_IAM: callers sign their requests;
   # the flow route is not served here, so nothing reaches the runtime's
-  # delivery path from outside.
+  # delivery path from outside. The URL buffers responses (the default
+  # invoke mode), so GET /runs/:runId/stream answers once the stream closes.
   ApiFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: lambda.api
       Policies:
-        - Ref: WorldPolicy
+        - Ref: SenderPolicy
       FunctionUrlConfig:
         AuthType: AWS_IAM
     Metadata:
@@ -193,6 +249,10 @@ Resources:
         Sourcemap: true
         EntryPoints: [src/lambda.ts]
         OutExtension: [.js=.mjs]
+        # Gives the ESM bundle the `require` its CommonJS dependencies call.
+        # Not verified through `sam build` (only with esbuild directly): if
+        # the builder ignores Banner, the bundle fails at import; then try
+        # `Format: cjs` (and no OutExtension), which needs no banner.
         Banner:
           - js=import { createRequire as bannerRequire } from 'node:module'; const require = bannerRequire(import.meta.url);
 
@@ -229,6 +289,37 @@ Resources:
         Sourcemap: true
         EntryPoints: [src/lambda.ts]
         OutExtension: [.js=.mjs]
+        # Unverified through `sam build`; see ApiFunction.
+        Banner:
+          - js=import { createRequire as bannerRequire } from 'node:module'; const require = bannerRequire(import.meta.url);
+
+  # Re-enqueues the runs that have not ended on a schedule (world.recover(),
+  # at most once per recovery interval per table across processes), so a
+  # lost message is recovered while the queues are idle. Optional: an empty
+  # RecoverySchedule leaves it out.
+  RecoverFunction:
+    Type: AWS::Serverless::Function
+    Condition: ScheduledRecovery
+    Properties:
+      Handler: lambda.recover
+      Policies:
+        - Ref: SenderPolicy
+      Events:
+        Recovery:
+          Type: Schedule
+          Properties:
+            Schedule:
+              Ref: RecoverySchedule
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: node22
+        Platform: node
+        Sourcemap: true
+        EntryPoints: [src/lambda.ts]
+        OutExtension: [.js=.mjs]
+        # Unverified through `sam build`; see ApiFunction.
         Banner:
           - js=import { createRequire as bannerRequire } from 'node:module'; const require = bannerRequire(import.meta.url);
 

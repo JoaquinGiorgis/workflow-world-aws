@@ -6,6 +6,9 @@
  * - `queue`: the target of the SQS event source mappings on the workflow
  *   and step queues. It answers `{ batchItemFailures }`, so the mappings
  *   need `ReportBatchItemFailures`.
+ * - `recover`: invoked on a schedule. `queue` recovers runs on the first
+ *   event of each process only; this recovers the ones whose next message
+ *   was lost while no event arrives.
  */
 import { createSqsLambdaHandler } from '@joaquingiorgis/world-aws';
 import { handle } from 'hono/aws-lambda';
@@ -15,3 +18,5 @@ import { world } from './world.ts';
 export const api = handle(app);
 
 export const queue = createSqsLambdaHandler({ world });
+
+export const recover = async () => ({ recovered: await world.recover() });

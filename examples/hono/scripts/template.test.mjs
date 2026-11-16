@@ -73,17 +73,69 @@ test('the queue function reports batch item failures on both queues', () => {
   assert.deepEqual(queues.sort(), ['StepQueue', 'WorkflowQueue']);
 });
 
-test('the functions get the documented IAM policy, no more', () => {
-  const statements = resources.WorldPolicy.Properties.PolicyDocument.Statement;
+/** [Sid, actions] of each statement of a managed policy of the template. */
+const statementsOf = (name) =>
+  resources[name].Properties.PolicyDocument.Statement.map((s) => [
+    s.Sid,
+    s.Action,
+  ]);
+
+/** What only a consumer of the queues does. */
+const consumerActions = new Set([
+  'sqs:ReceiveMessage',
+  'sqs:DeleteMessage',
+  'sqs:ChangeMessageVisibility',
+]);
+
+test('the queue function gets the documented IAM policy, no more', () => {
   assert.deepEqual(
-    statements.map((s) => [s.Sid, s.Action]),
+    statementsOf('WorldPolicy'),
     policy.Statement.map((s) => [s.Sid, s.Action])
   );
-  for (const name of ['ApiFunction', 'QueueFunction']) {
+  assert.deepEqual(resources.QueueFunction.Properties.Policies, [
+    { Ref: 'WorldPolicy' },
+  ]);
+});
+
+test('the functions that only send get the policy without the consumer actions', () => {
+  assert.deepEqual(
+    statementsOf('SenderPolicy'),
+    policy.Statement.map((s) => [
+      s.Sid,
+      s.Action.filter((action) => !consumerActions.has(action)),
+    ])
+  );
+  // The same resources as the World's policy.
+  assert.deepEqual(
+    resources.SenderPolicy.Properties.PolicyDocument.Statement.map(
+      (s) => s.Resource
+    ),
+    resources.WorldPolicy.Properties.PolicyDocument.Statement.map(
+      (s) => s.Resource
+    )
+  );
+  for (const name of ['ApiFunction', 'RecoverFunction']) {
     assert.deepEqual(resources[name].Properties.Policies, [
-      { Ref: 'WorldPolicy' },
+      { Ref: 'SenderPolicy' },
     ]);
   }
+});
+
+test('an optional schedule recovers the runs while the queues are idle', () => {
+  const { Properties: fn, Condition } = resources.RecoverFunction;
+  assert.equal(fn.Handler, 'lambda.recover');
+  assert.equal(Condition, 'ScheduledRecovery');
+  assert.ok(template.Conditions.ScheduledRecovery);
+  const [schedule] = Object.values(fn.Events);
+  assert.equal(schedule.Type, 'Schedule');
+  assert.deepEqual(schedule.Properties.Schedule, { Ref: 'RecoverySchedule' });
+  assert.equal(template.Parameters.RecoverySchedule.Default, 'rate(15 minutes)');
+});
+
+test('the functions do not name the World package for the runtime to load', () => {
+  // The bundle cannot load it by name; src/world.ts calls setWorld().
+  const variables = template.Globals.Function.Environment.Variables;
+  assert.equal(variables.WORKFLOW_TARGET_WORLD, undefined);
 });
 
 test('the bucket expires the bodies of queue messages', () => {
