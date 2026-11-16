@@ -17,6 +17,7 @@ import {
   PutCommand,
   QueryCommand,
   TransactWriteCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import {
   SPEC_VERSION_DEFAULT_MINTED,
@@ -563,6 +564,43 @@ describe('createWorld', () => {
       }
     }
   );
+
+  it('settles once the idempotency keys of its sends are marked sent', async () => {
+    const clients = createClients(options);
+    const ddb = mockClient(clients.documents);
+    const sqs = mockClient(clients.sqs);
+    let confirm!: () => void;
+    ddb.on(PutCommand).resolves({});
+    ddb.on(UpdateCommand).callsFake(
+      () =>
+        new Promise((resolve) => {
+          confirm = () => resolve({});
+        })
+    );
+    sqs.on(SendMessageCommand).resolves({ MessageId: 'sqs' });
+    const world = createWorld({ ...options, clients });
+    try {
+      await world.queue('__wkf_workflow_wf', { runId: 'wrun_A' } as never, {
+        idempotencyKey: 'key',
+      });
+      let settled = false;
+      const settling = world.settled().then(() => {
+        settled = true;
+      });
+      await vi.waitFor(() =>
+        expect(ddb.commandCalls(UpdateCommand)).toHaveLength(1)
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settled).toBe(false);
+      confirm();
+      await settling;
+    } finally {
+      await world.close();
+      ddb.restore();
+      sqs.restore();
+      destroyClients(clients);
+    }
+  });
 
   it('closes once', async () => {
     const world = createWorld(options);

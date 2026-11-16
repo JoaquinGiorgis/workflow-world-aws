@@ -113,6 +113,10 @@ sam deploy --guided
 the example as is, the root package has to be built first (it is linked
 with `link:../..`), or replace the link with a version from npm.
 
+The `api` function awaits `world.settled()` before answering, so the
+idempotency keys of the messages it sent are marked sent before Lambda
+can freeze the process.
+
 The function URL takes SigV4-signed requests only. To call it from a
 browser or from outside AWS, put API Gateway with your own auth in front
 of `ApiFunction`, or switch the URL to `AuthType: NONE` and add auth to

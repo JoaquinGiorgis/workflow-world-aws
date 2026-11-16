@@ -229,6 +229,14 @@ only a new process tries again. Before answering, the handler waits for
 the idempotency-key confirmations its deliveries started, since Lambda
 may freeze the process right after.
 
+**Functions that only send.** A function that starts runs or resumes hooks
+(an API behind a function URL or API Gateway) sends some messages with an
+idempotency key, and `queue()` answers before the key is marked sent.
+Await `world.settled()` before the function answers, as the `api`
+function of `examples/hono` does; otherwise a frozen process can leave a
+key reserved, and the next send under it waits up to 10 minutes (see
+Idempotency under [Queue](#queue)).
+
 **Recovery needs an event.** Lambda runs the handler only when a message
 arrives, and the `api` side never recovers. If the message that would
 continue a run is lost and the queues are otherwise idle, the run stays

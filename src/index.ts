@@ -58,6 +58,14 @@ export type AwsWorld = World &
      * {@link createSqsLambdaHandler}.
      */
     handleSqsEvent(event: SqsLambdaEvent): Promise<SqsBatchResponse>;
+    /**
+     * Resolves once the idempotency keys of earlier sends are marked sent.
+     * `queue()` answers before that write lands; a process about to be
+     * frozen, such as a Lambda function that sends (starts runs, resumes
+     * hooks) and is about to answer, awaits this first. `close()` and the
+     * handler of `createSqsLambdaHandler()` wait for it already.
+     */
+    settled(): Promise<void>;
     close(): Promise<void>;
   };
 
@@ -162,6 +170,7 @@ export function createWorld(options: CreateWorldOptions = {}): AwsWorld {
     registerHandler: queue.registerHandler,
     registerRoute: queue.registerRoute,
     handleSqsEvent: queue.handleSqsEvent,
+    settled: queue.settled,
 
     streams: streamer.streams,
 
