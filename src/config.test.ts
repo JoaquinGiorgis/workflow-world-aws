@@ -128,4 +128,63 @@ describe('resolveConfig', () => {
     expect(problems).toHaveLength(1);
     expect(problems[0]).toContain(`\`${key}\` must be an integer`);
   });
+
+  it('reads the numeric options from WORKFLOW_AWS_* variables', () => {
+    const config = resolveConfig({
+      ...validEnv,
+      WORKFLOW_AWS_CONCURRENCY: '4',
+      WORKFLOW_AWS_VISIBILITY_TIMEOUT_SECONDS: '30',
+      WORKFLOW_AWS_SHUTDOWN_GRACE_MS: '0',
+      WORKFLOW_AWS_POLL_WAIT_SECONDS: '1',
+      WORKFLOW_AWS_STREAM_POLL_INTERVAL_MS: ' 100 ',
+    });
+    expect(config).toMatchObject({
+      concurrency: 4,
+      visibilityTimeoutSeconds: 30,
+      shutdownGraceMs: 0,
+      pollWaitSeconds: 1,
+      streamPollIntervalMs: 100,
+    });
+  });
+
+  it('prefers an explicit numeric option over its variable', () => {
+    const config = resolveConfig(
+      { ...validEnv, WORKFLOW_AWS_POLL_WAIT_SECONDS: '1' },
+      { pollWaitSeconds: 5 }
+    );
+    expect(config.pollWaitSeconds).toBe(5);
+  });
+
+  it('long polls for 20 seconds by default', () => {
+    expect(resolveConfig(validEnv).pollWaitSeconds).toBe(20);
+  });
+
+  it.each([
+    ['WORKFLOW_AWS_CONCURRENCY', 'ten'],
+    ['WORKFLOW_AWS_POLL_WAIT_SECONDS', '21'],
+    ['WORKFLOW_AWS_VISIBILITY_TIMEOUT_SECONDS', '0'],
+    ['WORKFLOW_AWS_SHUTDOWN_GRACE_MS', '1.5'],
+  ])('rejects %s=%j', (name, value) => {
+    const problems = problemsOf(() =>
+      resolveConfig({ ...validEnv, [name]: value })
+    );
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain(`${name} must be an integer`);
+    expect(problems[0]).toContain(JSON.stringify(value));
+  });
+
+  it('reads the delivery base URL and validates it', () => {
+    expect(
+      resolveConfig({
+        ...validEnv,
+        WORKFLOW_AWS_BASE_URL: 'http://localhost:3000',
+      }).baseUrl
+    ).toBe('http://localhost:3000');
+    expect(resolveConfig(validEnv)).not.toHaveProperty('baseUrl');
+    expect(
+      problemsOf(() =>
+        resolveConfig({ ...validEnv, WORKFLOW_AWS_BASE_URL: 'localhost' })
+      )[0]
+    ).toContain('WORKFLOW_AWS_BASE_URL');
+  });
 });
