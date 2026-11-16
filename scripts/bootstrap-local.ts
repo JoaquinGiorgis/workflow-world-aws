@@ -68,7 +68,7 @@ export async function bootstrapLocal(
     options.clients ??
     createClients({ region: options.region, endpoint: options.endpoint });
   try {
-    await createTable(clients, options.tableName);
+    await createWorkflowTable(clients, options.tableName);
 
     const maxReceiveCount = options.maxReceiveCount ?? 5;
     const visibilityTimeoutSeconds = options.visibilityTimeoutSeconds ?? 60;
@@ -100,7 +100,12 @@ export async function bootstrapLocal(
   }
 }
 
-async function createTable(
+/**
+ * Creates the World's table: PK/SK, GSI1 (every run and every hook, by id)
+ * and GSI2 (runs per workflow name), on-demand billing, and TTL on
+ * {@link TTL_ATTRIBUTE}. Keeps a table that already exists.
+ */
+export async function createWorkflowTable(
   clients: AwsClients,
   tableName: string
 ): Promise<void> {

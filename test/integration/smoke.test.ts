@@ -7,6 +7,7 @@ import {
   SendMessageCommand,
 } from '@aws-sdk/client-sqs';
 import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { slotToEventId } from '@workflow/world';
 import { afterAll, describe, expect, inject, it } from 'vitest';
 import { createClients, destroyClients } from '../../src/clients.js';
 import { resolveConfig } from '../../src/config.js';
@@ -40,7 +41,10 @@ describe('smoke test against the local emulator', () => {
     await clients.documents.send(
       new PutCommand({
         TableName: config.tableName,
-        Item: { ...eventKey(runId, 1), eventType: 'run_created' },
+        Item: {
+          ...eventKey(runId, slotToEventId(1)),
+          eventType: 'run_created',
+        },
         ConditionExpression: 'attribute_not_exists(SK)',
       })
     );
@@ -60,9 +64,12 @@ describe('smoke test against the local emulator', () => {
     });
 
     const event = await clients.documents.send(
-      new GetCommand({ TableName: config.tableName, Key: eventKey(runId, 1) })
+      new GetCommand({
+        TableName: config.tableName,
+        Key: eventKey(runId, slotToEventId(1)),
+      })
     );
-    expect(event.Item?.SK).toBe('EVT#0000000001');
+    expect(event.Item?.SK).toBe('EVT#evnt_00000000000000000000000001');
   });
 
   it('has TTL enabled on expiresAt', async () => {

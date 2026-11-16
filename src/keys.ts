@@ -1,25 +1,30 @@
 /**
  * Key layout of the single DynamoDB table.
  *
- * | Entity              | PK                       | SK                 |
- * | ------------------- | ------------------------ | ------------------ |
- * | Run                 | `RUN#<runId>`            | `META`             |
- * | Event               | `RUN#<runId>`            | `EVT#<slot>`       |
- * | Step                | `RUN#<runId>`            | `STEP#<stepId>`    |
- * | Hook                | `RUN#<runId>`            | `HOOK#<hookId>`    |
- * | Wait                | `RUN#<runId>`            | `WAIT#<waitId>`    |
- * | Snapshot            | `RUN#<runId>`            | `SNAP#<id>`        |
- * | Hook token          | `HOOKTOKEN#<token>`      | `TOKEN`            |
- * | Stream chunk        | `STREAM#<runId>#<name>`  | `CHUNK#<seq>`      |
- * | Stream end marker   | `STREAM#<runId>#<name>`  | `CLOSED`           |
- * | Queue idempotency   | `IDEMP#<key>`            | `Q`                |
+ * | Entity                 | PK                       | SK                  |
+ * | ---------------------- | ------------------------ | ------------------- |
+ * | Run                    | `RUN#<runId>`            | `META`              |
+ * | Event                  | `RUN#<runId>`            | `EVT#<eventId>`     |
+ * | Step                   | `RUN#<runId>`            | `STEP#<stepId>`     |
+ * | Hook                   | `RUN#<runId>`            | `HOOK#<hookId>`     |
+ * | Wait                   | `RUN#<runId>`            | `WAIT#<waitId>`     |
+ * | Snapshot               | `RUN#<runId>`            | `SNAPSHOT`          |
+ * | Hook resume (dedup)    | `RUN#<runId>`            | `RESUME#<resumeId>` |
+ * | attr_set (dedup)       | `RUN#<runId>`            | `ATTR#<corrId>`     |
+ * | Start Hook admission   | `RUN#<runId>`            | `ADMISSION`         |
+ * | Hook id → run          | `HOOKID#<hookId>`        | `HOOK`              |
+ * | Hook token claim       | `HOOKTOKEN#<token>`      | `TOKEN`             |
+ * | Stream chunk           | `STREAM#<runId>#<name>`  | `CHUNK#<seq>`       |
+ * | Stream end marker      | `STREAM#<runId>#<name>`  | `CLOSED`            |
+ * | Queue idempotency      | `IDEMP#<key>`            | `Q`                 |
  *
- * Event slots and chunk sequence numbers are zero-padded to
- * {@link SORT_NUMBER_WIDTH} digits so that the lexicographic order DynamoDB
- * sorts by is the numeric order.
+ * Event ids are slots (`evnt_` and a 26-digit zero-padded position), so
+ * `EVT#<eventId>` sorts in log order. Chunk sequence numbers are zero-padded
+ * to {@link SORT_NUMBER_WIDTH} digits for the same reason.
  *
- * GSI1 lists runs per deployment and GSI2 per workflow name, both ordered by
- * creation time.
+ * GSI1 lists every run (`RUNS`) and every hook (`HOOKS`) by id; run ids
+ * are ULIDs, so id order is creation order. GSI2 lists the runs of one
+ * workflow (`WF#<workflowName>`), also by id.
  */
 
 export interface TableKey {
@@ -27,12 +32,15 @@ export interface TableKey {
   SK: string;
 }
 
-/** Digits in a padded event slot or chunk sequence number. */
+/** Digits in a padded chunk sequence number. */
 export const SORT_NUMBER_WIDTH = 10;
 /** Largest number that fits in {@link SORT_NUMBER_WIDTH} digits. */
 export const MAX_SORT_NUMBER = 10 ** SORT_NUMBER_WIDTH - 1;
 
 export const RUN_META_SK = 'META';
+export const SNAPSHOT_SK = 'SNAPSHOT';
+export const ADMISSION_SK = 'ADMISSION';
+export const HOOK_ID_SK = 'HOOK';
 export const HOOK_TOKEN_SK = 'TOKEN';
 export const STREAM_CLOSED_SK = 'CLOSED';
 export const IDEMPOTENCY_SK = 'Q';
@@ -43,17 +51,22 @@ export const PREFIX = {
   step: 'STEP#',
   hook: 'HOOK#',
   wait: 'WAIT#',
-  snapshot: 'SNAP#',
+  resume: 'RESUME#',
+  attr: 'ATTR#',
+  hookId: 'HOOKID#',
   hookToken: 'HOOKTOKEN#',
   stream: 'STREAM#',
   chunk: 'CHUNK#',
   idempotency: 'IDEMP#',
-  runsByDeployment: 'RUNS#',
   runsByWorkflow: 'WF#',
 } as const;
 
 export const GSI1_NAME = 'GSI1';
 export const GSI2_NAME = 'GSI2';
+/** GSI1 partition holding every run. */
+export const ALL_RUNS_GSI1PK = 'RUNS';
+/** GSI1 partition holding every hook. */
+export const ALL_HOOKS_GSI1PK = 'HOOKS';
 
 function requireComponent(value: string, what: string): string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -101,20 +114,20 @@ export function runMetaKey(runId: string): TableKey {
   return { PK: runPk(runId), SK: RUN_META_SK };
 }
 
-/** Sort key of the event at a 1-based slot of its run's log. */
-export function eventSk(slot: number): string {
-  if (!Number.isInteger(slot) || slot < 1) {
-    throw new RangeError(`Event slots start at 1, got ${slot}`);
+/** Sort key of an event: its id, which sorts in log order. */
+export function eventSk(eventId: string): string {
+  return `${PREFIX.event}${requireComponent(eventId, 'eventId')}`;
+}
+
+export function eventIdFromSk(sk: string): string {
+  if (!sk.startsWith(PREFIX.event) || sk.length === PREFIX.event.length) {
+    throw new TypeError(`Not an event sort key: ${sk}`);
   }
-  return `${PREFIX.event}${padSortNumber(slot)}`;
+  return sk.slice(PREFIX.event.length);
 }
 
-export function eventSlotFromSk(sk: string): number {
-  return parseSortNumber(sk, PREFIX.event);
-}
-
-export function eventKey(runId: string, slot: number): TableKey {
-  return { PK: runPk(runId), SK: eventSk(slot) };
+export function eventKey(runId: string, eventId: string): TableKey {
+  return { PK: runPk(runId), SK: eventSk(eventId) };
 }
 
 export function stepKey(runId: string, stepId: string): TableKey {
@@ -131,17 +144,45 @@ export function hookKey(runId: string, hookId: string): TableKey {
   };
 }
 
-export function waitKey(runId: string, waitId: string): TableKey {
+/** A wait is keyed by its correlation id within the run. */
+export function waitKey(runId: string, correlationId: string): TableKey {
   return {
     PK: runPk(runId),
-    SK: `${PREFIX.wait}${requireComponent(waitId, 'waitId')}`,
+    SK: `${PREFIX.wait}${requireComponent(correlationId, 'correlationId')}`,
   };
 }
 
-export function snapshotKey(runId: string, snapshotId: string): TableKey {
+/** The run's VM snapshot; each save replaces the previous one. */
+export function snapshotKey(runId: string): TableKey {
+  return { PK: runPk(runId), SK: SNAPSHOT_SK };
+}
+
+/** Marks a `hook_received` resume id as used, for `hookResumeDedup`. */
+export function resumeKey(runId: string, resumeId: string): TableKey {
   return {
     PK: runPk(runId),
-    SK: `${PREFIX.snapshot}${requireComponent(snapshotId, 'snapshotId')}`,
+    SK: `${PREFIX.resume}${requireComponent(resumeId, 'resumeId')}`,
+  };
+}
+
+/** Marks a workflow `attr_set` correlation id as used. */
+export function attrSetKey(runId: string, correlationId: string): TableKey {
+  return {
+    PK: runPk(runId),
+    SK: `${PREFIX.attr}${requireComponent(correlationId, 'correlationId')}`,
+  };
+}
+
+/** The start Hook admission decision of a candidate run id. */
+export function admissionKey(runId: string): TableKey {
+  return { PK: runPk(runId), SK: ADMISSION_SK };
+}
+
+/** Points from a hook id to the run that owns the hook. */
+export function hookIdKey(hookId: string): TableKey {
+  return {
+    PK: `${PREFIX.hookId}${requireComponent(hookId, 'hookId')}`,
+    SK: HOOK_ID_SK,
   };
 }
 
@@ -181,33 +222,26 @@ export function idempotencyKey(key: string): TableKey {
   };
 }
 
-function creationSortKey(createdAt: Date, runId: string): string {
-  if (Number.isNaN(createdAt.getTime())) {
-    throw new RangeError('createdAt must be a valid date');
-  }
-  return `${createdAt.toISOString()}#${requireRunId(runId)}`;
-}
-
-/** GSI1 attributes: runs of a deployment, oldest first. */
-export function runsByDeploymentGsi1(
-  deploymentId: string,
-  createdAt: Date,
-  runId: string
-): { GSI1PK: string; GSI1SK: string } {
+/** Index attributes of a run item: GSI1 (all runs), GSI2 (per workflow). */
+export function runIndexKeys(
+  runId: string,
+  workflowName: string
+): { GSI1PK: string; GSI1SK: string; GSI2PK: string; GSI2SK: string } {
   return {
-    GSI1PK: `${PREFIX.runsByDeployment}${requireComponent(deploymentId, 'deploymentId')}`,
-    GSI1SK: creationSortKey(createdAt, runId),
+    GSI1PK: ALL_RUNS_GSI1PK,
+    GSI1SK: requireRunId(runId),
+    GSI2PK: `${PREFIX.runsByWorkflow}${requireComponent(workflowName, 'workflowName')}`,
+    GSI2SK: runId,
   };
 }
 
-/** GSI2 attributes: runs of a workflow, oldest first. */
-export function runsByWorkflowGsi2(
-  workflowName: string,
-  createdAt: Date,
-  runId: string
-): { GSI2PK: string; GSI2SK: string } {
+/** Index attributes of a hook item: GSI1 (all hooks). */
+export function hookIndexKeys(hookId: string): {
+  GSI1PK: string;
+  GSI1SK: string;
+} {
   return {
-    GSI2PK: `${PREFIX.runsByWorkflow}${requireComponent(workflowName, 'workflowName')}`,
-    GSI2SK: creationSortKey(createdAt, runId),
+    GSI1PK: ALL_HOOKS_GSI1PK,
+    GSI1SK: requireComponent(hookId, 'hookId'),
   };
 }

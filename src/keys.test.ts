@@ -1,19 +1,24 @@
+import { slotToEventId } from '@workflow/world';
 import { describe, expect, it } from 'vitest';
 import {
+  admissionKey,
+  attrSetKey,
   chunkKey,
   chunkSeqFromSk,
   chunkSk,
+  eventIdFromSk,
   eventKey,
   eventSk,
-  eventSlotFromSk,
+  hookIdKey,
+  hookIndexKeys,
   hookKey,
   hookTokenKey,
   idempotencyKey,
   MAX_SORT_NUMBER,
   padSortNumber,
+  resumeKey,
+  runIndexKeys,
   runMetaKey,
-  runsByDeploymentGsi1,
-  runsByWorkflowGsi2,
   snapshotKey,
   stepKey,
   streamClosedKey,
@@ -35,36 +40,38 @@ describe('padSortNumber', () => {
 });
 
 describe('event keys', () => {
-  it('lives in the run partition', () => {
-    expect(eventKey(runId, 1)).toEqual({
+  it('lives in the run partition, keyed by the event id', () => {
+    expect(eventKey(runId, slotToEventId(1))).toEqual({
       PK: `RUN#${runId}`,
-      SK: 'EVT#0000000001',
+      SK: 'EVT#evnt_00000000000000000000000001',
     });
   });
 
-  it('rejects slot 0, since slots are 1-based', () => {
-    expect(() => eventSk(0)).toThrow(RangeError);
+  it('rejects an empty event id', () => {
+    expect(() => eventSk('')).toThrow(TypeError);
   });
 
-  it('sorts lexicographically in numeric order', () => {
+  it('sorts slot ids lexicographically in numeric order', () => {
     const slots = [1, 2, 9, 10, 11, 99, 100, 1_000, 12_345, 1_000_000_000];
-    const keys = slots.map(eventSk);
+    const keys = slots.map((slot) => eventSk(slotToEventId(slot)));
     const shuffled = [...keys].reverse();
     expect(shuffled.sort()).toEqual(keys);
   });
 
-  it('round-trips the slot', () => {
-    for (const slot of [1, 7, 10, 123_456_789, MAX_SORT_NUMBER]) {
-      expect(eventSlotFromSk(eventSk(slot))).toBe(slot);
-    }
+  it('sorts legacy wevt_ ids after slot ids, as world-postgres orders them', () => {
+    expect(
+      eventSk(slotToEventId(1)) < eventSk('wevt_01JD0000000000000000000000')
+    ).toBe(true);
   });
 
-  it.each(['EVT#1', 'STEP#0000000001', 'EVT#00000000x1'])(
-    'refuses to parse %s',
-    (sk) => {
-      expect(() => eventSlotFromSk(sk)).toThrow(TypeError);
-    }
-  );
+  it('round-trips the event id', () => {
+    const eventId = slotToEventId(123_456_789);
+    expect(eventIdFromSk(eventSk(eventId))).toBe(eventId);
+  });
+
+  it.each(['EVT#', 'STEP#evnt_1'])('refuses to parse %s', (sk) => {
+    expect(() => eventIdFromSk(sk)).toThrow(TypeError);
+  });
 });
 
 describe('chunk keys', () => {
@@ -99,11 +106,15 @@ describe('entity keys', () => {
     expect(stepKey(runId, 'step_1').SK).toBe('STEP#step_1');
     expect(hookKey(runId, 'hook_1').SK).toBe('HOOK#hook_1');
     expect(waitKey(runId, 'wait_1').SK).toBe('WAIT#wait_1');
-    expect(snapshotKey(runId, 'latest').SK).toBe('SNAP#latest');
+    expect(snapshotKey(runId).SK).toBe('SNAPSHOT');
+    expect(resumeKey(runId, 'res_1').SK).toBe('RESUME#res_1');
+    expect(attrSetKey(runId, 'attr_1').SK).toBe('ATTR#attr_1');
+    expect(admissionKey(runId).SK).toBe('ADMISSION');
   });
 
   it('builds the global token and idempotency keys', () => {
     expect(hookTokenKey('tok')).toEqual({ PK: 'HOOKTOKEN#tok', SK: 'TOKEN' });
+    expect(hookIdKey('hook_1')).toEqual({ PK: 'HOOKID#hook_1', SK: 'HOOK' });
     expect(idempotencyKey('k-1')).toEqual({ PK: 'IDEMP#k-1', SK: 'Q' });
   });
 
@@ -116,34 +127,23 @@ describe('entity keys', () => {
 });
 
 describe('GSI keys', () => {
-  it('orders runs by creation time', () => {
-    const earlier = runsByDeploymentGsi1(
-      'dpl_1',
-      new Date('2026-01-02T03:04:05.006Z'),
-      'wrun_B'
-    );
-    const later = runsByDeploymentGsi1(
-      'dpl_1',
-      new Date('2026-11-15T00:00:00.000Z'),
-      'wrun_A'
-    );
-    expect(earlier).toEqual({
-      GSI1PK: 'RUNS#dpl_1',
-      GSI1SK: '2026-01-02T03:04:05.006Z#wrun_B',
-    });
-    expect(earlier.GSI1SK < later.GSI1SK).toBe(true);
-  });
-
-  it('indexes runs by workflow name', () => {
-    expect(runsByWorkflowGsi2('wf//add', new Date(0), 'wrun_A')).toEqual({
+  it('indexes every run by id, and runs per workflow by id', () => {
+    expect(runIndexKeys('wrun_A', 'wf//add')).toEqual({
+      GSI1PK: 'RUNS',
+      GSI1SK: 'wrun_A',
       GSI2PK: 'WF#wf//add',
-      GSI2SK: '1970-01-01T00:00:00.000Z#wrun_A',
+      GSI2SK: 'wrun_A',
     });
   });
 
-  it('rejects an invalid date', () => {
-    expect(() => runsByWorkflowGsi2('wf', new Date('nope'), 'wrun_A')).toThrow(
-      RangeError
-    );
+  it('indexes every hook by id', () => {
+    expect(hookIndexKeys('hook_1')).toEqual({
+      GSI1PK: 'HOOKS',
+      GSI1SK: 'hook_1',
+    });
+  });
+
+  it('rejects an empty workflow name', () => {
+    expect(() => runIndexKeys('wrun_A', '')).toThrow(TypeError);
   });
 });
