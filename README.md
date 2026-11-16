@@ -193,7 +193,8 @@ With a bucket (`bucket` / `WORKFLOW_AWS_BUCKET`), what does not fit
 DynamoDB or SQS goes to S3:
 
 - **Item values.** When an item would be over 350 KB, or a transaction over
-  4 MB, its largest values (never keys, counters or attributes a condition
+  4 MB less a 256 KB margin (DynamoDB also counts keys, names and
+  expressions), its largest values (never keys, counters or attributes a condition
   reads) are written to
   `s3://<bucket>/<runId>/<kind>/<id>/<attribute>-<sha256>` (`kind` is
   `run`, `event`, `step`, `hook`, `wait`, `snapshot` or `stream`), and the
@@ -201,9 +202,13 @@ DynamoDB or SQS goes to S3:
   resolve it transparently, so `runs.get`, `steps.get`, `events.list`,
   `hooks.get`, snapshots and stream reads return the same data as before.
   Binaries are stored as they are; other values as JSON. Objects are named
-  by their content and never change, so a retried write reuses its object
-  and reads cache them (32 MiB per World). A World without a bucket still
-  reads references written by one that had it.
+  by their content and never change, so the retries of one write upload
+  each value once and reads cache them (32 MiB per World). A VM snapshot,
+  whose object is deleted when the snapshot is replaced, gets its own
+  object on every save (`data-<sha256>-<ulid>`), so a delete never removes
+  an object another save still references. A World without a bucket still
+  reads references written by one that had it. A configured bucket that
+  does not exist fails the write with `PayloadBucketError`, naming it.
 - **Queue messages.** A message over 256 KiB is written whole to
   `s3://<bucket>/queue/<runId>/<messageId>/<ulid>-<sha256>`, and its SQS
   body carries only its ids and the reference. The worker reads it back
@@ -261,10 +266,15 @@ not supported: they have no per-message delay.
   failing to the dead-letter queue. `meta.attempt` and `meta.deliveryCount`
   are SQS's `ApproximateReceiveCount` plus the deliveries of earlier copies
   of the message. A spec 9 run's orchestrator deliveries wait for each
-  other within a process; across processes the in-band fence keeps an
-  overlap safe, which is why `maxConcurrency` is not declared.
-- **Shutdown.** `close()` stops receiving, gives back the messages it has
-  not started, waits up to `shutdownGraceMs` for the running deliveries,
+  other within a process, holding no slot while they wait (as in
+  world-local), so other runs keep their share of `concurrency`; across
+  processes the in-band fence keeps an overlap safe, which is why
+  `maxConcurrency` is not declared. Under `DEBUG=workflow:*` the worker
+  logs each delivery's start and outcome (acknowledged, rescheduled with
+  its `timeoutSeconds`, or failed) with its message id, run and attempt.
+- **Shutdown.** `close()` stops receiving, gives back at once the messages
+  it has not started (those waiting for their run included), waits up to
+  `shutdownGraceMs` for the running deliveries,
   then stops their heartbeats without acknowledging them (SQS delivers them
   again after their visibility timeout) and releases the clients. It is
   idempotent. One worker runs per process for a set of queues, even if
@@ -387,6 +397,11 @@ is not LocalStack) from the rest:
 ```bash
 WORKFLOW_AWS_ENDPOINT=http://localhost:4566 pnpm test:integration
 ```
+
+CI runs the integration suite on every push against both LocalStack
+(which, unlike moto, isolates transactions as DynamoDB does) and
+moto_server 5.x. A failed `@workflow/world-testing` test prints its app
+server's delivery trace and what its table and queues held.
 
 To create the table, queues and bucket by hand against an emulator:
 
