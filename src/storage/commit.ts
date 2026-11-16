@@ -26,14 +26,20 @@ import { WorkflowWorldError } from '@workflow/errors';
 import { IN_BAND_SEQ_AT_RUN_CREATION, slotToEventId } from '@workflow/world';
 import { monotonicFactory } from 'ulid';
 import { eventKey, runMetaKey } from '../keys.js';
+import {
+  DYNAMODB_ITEM_BYTES,
+  MAX_ITEM_BYTES,
+  PayloadTooLargeError,
+} from './errors.js';
 import type { Item } from './items.js';
+import { debugLog } from './log.js';
 import {
   MAX_TRANSACTION_ITEMS,
   sleep,
   type Table,
   type TransactItem,
 } from './table.js';
-import { toStorable } from './values.js';
+import { sizeOf, toStorable } from './values.js';
 
 /** A run's counters as a decision read them. */
 export interface RunState {
@@ -191,6 +197,13 @@ export async function commit<R>(
     } catch (error) {
       const reasons = cancellationReasons(error);
       if (reasons === undefined) throw error;
+      if (itemTooLarge(error)) {
+        throw new PayloadTooLargeError(
+          `An item of ${what}`,
+          undefined,
+          DYNAMODB_ITEM_BYTES
+        );
+      }
       // No reasons at all: an emulator that does not report them. Deciding
       // again is always safe; a permanent error then exhausts the attempts.
       if (
@@ -207,7 +220,7 @@ export async function commit<R>(
       continue;
     }
 
-    for (const entry of deferred) await runCleanup(table, entry);
+    await runDeferredCleanup(table, what, deferred);
     return plan.done(committed);
   }
   throw new WorkflowWorldError(
@@ -276,6 +289,15 @@ function appendItems(
     return items;
   }
 
+  // The run item carries input, output, error, attributes and the start
+  // Hook together: an update can grow it over the limit although every
+  // value fits on its own.
+  if (append.set && state.item) {
+    const size = sizeOf({ ...state.item, ...(toStorable(append.set) as Item) });
+    if (size > MAX_ITEM_BYTES) {
+      throw new PayloadTooLargeError(`The run item of ${runId}`, size);
+    }
+  }
   const names: Record<string, string> = { '#rev': 'rev' };
   const values: Record<string, unknown> = {
     ':rev1': (state.rev ?? 0) + 1,
@@ -390,6 +412,43 @@ function unmarshallValue(value: unknown): unknown {
     default:
       return inner;
   }
+}
+
+/**
+ * Runs the cleanup left out of a committed transaction. The write it
+ * belongs to has committed, so a failure here is not the write's: the reads
+ * already treat a finished run's hooks and waits as gone, and what is left
+ * behind is only storage. It is logged under DEBUG and the write answers
+ * normally.
+ */
+async function runDeferredCleanup(
+  table: Table,
+  what: string,
+  deferred: TransactItem[]
+): Promise<void> {
+  try {
+    for (const entry of deferred) await runCleanup(table, entry);
+  } catch (error) {
+    debugLog('deferred cleanup failed after the commit', {
+      write: what,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * Whether DynamoDB cancelled the transaction because an item (after an
+ * update, say) went over its 400 KB limit.
+ */
+function itemTooLarge(error: unknown): boolean {
+  const reasons =
+    (error as { CancellationReasons?: { Code?: string; Message?: string }[] })
+      .CancellationReasons ?? [];
+  return reasons.some(
+    (reason) =>
+      reason.Code === 'ValidationError' &&
+      /item size/i.test(reason.Message ?? '')
+  );
 }
 
 /** A deferred cleanup delete; one that no longer applies is skipped. */

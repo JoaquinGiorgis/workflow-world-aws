@@ -40,6 +40,9 @@ export type TransactItem =
 /** DynamoDB's limit of items in one TransactWriteItems request. */
 export const MAX_TRANSACTION_ITEMS = 100;
 
+/** Largest `Limit` DynamoDB accepts (a 32-bit integer). */
+const MAX_QUERY_LIMIT = 2 ** 31 - 1;
+
 /** BatchGetItem's limit of keys per request. */
 const MAX_BATCH_GET_KEYS = 100;
 
@@ -108,17 +111,19 @@ export class Table {
   /**
    * Up to `want` items of a query, following DynamoDB's pages. With a
    * filter, DynamoDB applies `Limit` before filtering, so pages are read
-   * whole until enough items matched.
+   * whole until enough items matched. `Limit` is a 32-bit integer in the
+   * DynamoDB API: an unbounded `want` sends none and reads whole pages.
    */
   async collect(input: QueryInput, want: number): Promise<Item[]> {
     const items: Item[] = [];
     let startKey = input.ExclusiveStartKey;
     const filtered = input.FilterExpression !== undefined;
     do {
+      const remaining = Math.max(1, want - items.length);
       const page = await this.queryPage({
         ...input,
         ExclusiveStartKey: startKey,
-        ...(!filtered && { Limit: Math.max(1, want - items.length) }),
+        ...(!filtered && remaining <= MAX_QUERY_LIMIT && { Limit: remaining }),
       });
       items.push(...page.items);
       startKey = page.lastKey;
