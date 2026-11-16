@@ -1,0 +1,373 @@
+/**
+ * The World's queue on two SQS standard queues: one for workflow
+ * (orchestrator) messages and one for step messages, each with its own
+ * dead-letter queue. Both carry the same queue names (`__wkf_workflow_*`);
+ * a message with a `stepId` goes to the step queue, so step work and
+ * orchestration poll and scale apart.
+ *
+ * - `queue()` sends one SQS message (`message.ts`), deduplicated by
+ *   `idempotencyKey` on the World's table (`idempotency.ts`), with delays
+ *   over 15 minutes chained (`consumer.ts`).
+ * - `start()` runs the worker (`consumer.ts`), which delivers each message
+ *   to the handler registered for its prefix in this process, or over HTTP
+ *   to the app's route.
+ * - `createQueueHandler()` is the route side (`handler.ts`).
+ */
+import {
+  SendMessageBatchCommand,
+  type SendMessageBatchRequestEntry,
+  type SQSClient,
+} from '@aws-sdk/client-sqs';
+import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import {
+  MessageId,
+  parseQueueName,
+  parseQueueRoute,
+  type Queue,
+  type QueueBatchResult,
+  type QueueOptions,
+  type QueuePayload,
+  QueuePrefix,
+  type ValidQueueName,
+} from '@workflow/world';
+import {
+  createNodeHttpAgents,
+  destroyNodeHttpAgents,
+} from '@workflow/world/node-http.js';
+import {
+  Consumer,
+  type ConsumerOptions,
+  scheduleOf,
+  sendQueueMessage,
+} from './consumer.js';
+import { deliver } from './delivery.js';
+import { createQueueHandler } from './handler.js';
+import { IdempotencyStore } from './idempotency.js';
+import {
+  encodeMessage,
+  MESSAGE_FORMAT_VERSION,
+  type QueueMessage,
+} from './message.js';
+import { nextUlid, type SharedQueues, sharedQueues } from './state.js';
+
+/** What `getDeploymentId()` answers: this World has one deployment. */
+export const DEPLOYMENT_ID = 'aws';
+
+/**
+ * The `maxReceiveCount` the local bootstrap gives the queues' redrive
+ * policy: world-postgres' job attempts (the runtime's delivery cap of 49 and
+ * 24 more for its terminal write). With the worker's backoff that is days of
+ * retries, well past the contract's minimum redelivery span of an hour.
+ */
+export const DEFAULT_MAX_RECEIVE_COUNT = 73;
+
+/** SQS's request size limit, which a batch must fit in. */
+const MAX_BATCH_BYTES = 256 * 1024;
+const MAX_BATCH_ENTRIES = 10;
+
+export interface SqsQueueOptions {
+  sqs: SQSClient;
+  documents: DynamoDBDocumentClient;
+  tableName: string;
+  workflowQueueUrl: string;
+  stepQueueUrl: string;
+  /** Identifies the queues in the process registry (see `state.ts`). */
+  endpoint?: string;
+  baseUrl?: string;
+  concurrency: number;
+  visibilityTimeoutSeconds: number;
+  pollWaitSeconds: number;
+  shutdownGraceMs: number;
+  /** @internal Test hooks. */
+  internal?: Pick<
+    ConsumerOptions,
+    'retryDelaySeconds' | 'heartbeatIntervalMs' | 'log'
+  >;
+}
+
+export type SqsQueue = Queue &
+  Required<Pick<Queue, 'queueBatch' | 'registerHandler' | 'registerRoute'>> & {
+    /**
+     * Starts the worker. Resolves `true` when this call started it, `false`
+     * when it was running already (here or in another World over the same
+     * queues in this process) or the queue is closed.
+     */
+    startWorker(): Promise<boolean>;
+    start(): Promise<void>;
+    close(): Promise<void>;
+  };
+
+/** Whether a payload is a step's execution message. */
+function isStepMessage(payload: unknown): boolean {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    typeof (payload as { stepId?: unknown }).stepId === 'string'
+  );
+}
+
+export function createSqsQueue(options: SqsQueueOptions): SqsQueue {
+  const { sqs, workflowQueueUrl, stepQueueUrl } = options;
+  const shared: SharedQueues = sharedQueues(
+    [options.endpoint ?? '', workflowQueueUrl, stepQueueUrl].join('|')
+  );
+  const idempotency = new IdempotencyStore(
+    options.documents,
+    options.tableName
+  );
+  const agents = createNodeHttpAgents({
+    maxSockets: Number.POSITIVE_INFINITY,
+    keepAliveMs: 30_000,
+  });
+  let consumer: Consumer | undefined;
+  let closed = false;
+  let closing: Promise<void> | undefined;
+
+  const queueUrlFor = (payload: unknown) =>
+    isStepMessage(payload) ? stepQueueUrl : workflowQueueUrl;
+
+  /** The SQS message of a send, before deduplication. */
+  const prepare = (
+    queueName: ValidQueueName,
+    payload: QueuePayload,
+    opts: QueueOptions | undefined,
+    messageId: MessageId
+  ): QueueMessage => {
+    const { prefix } = parseQueueName(queueName);
+    const route = shared.routes.get(prefix);
+    return {
+      v: MESSAGE_FORMAT_VERSION,
+      messageId,
+      queueName,
+      payload,
+      createdAt: new Date().toISOString(),
+      ...(opts?.idempotencyKey !== undefined && {
+        idempotencyKey: opts.idempotencyKey,
+      }),
+      ...(opts?.headers && { headers: opts.headers }),
+      ...(route !== undefined && { route }),
+    };
+  };
+
+  const newMessageId = () => MessageId.parse(`msg_${nextUlid()}`);
+
+  const queue: Queue['queue'] = async (queueName, payload, opts) => {
+    parseQueueName(queueName);
+    const key = opts?.idempotencyKey;
+    const reservation = key
+      ? await idempotency.reserve(key, newMessageId())
+      : { owner: true, messageId: newMessageId() };
+    if (!reservation.owner) return { messageId: reservation.messageId };
+
+    const message = prepare(queueName, payload, opts, reservation.messageId);
+    try {
+      await sendQueueMessage(
+        sqs,
+        queueUrlFor(payload),
+        message,
+        opts?.delaySeconds
+      );
+    } catch (error) {
+      if (key) await idempotency.release(key, reservation.messageId);
+      throw error;
+    }
+    if (key) await idempotency.confirm(key, reservation.messageId);
+    return { messageId: reservation.messageId };
+  };
+
+  const queueBatch: NonNullable<Queue['queueBatch']> = async (
+    queueName,
+    messages
+  ) => {
+    parseQueueName(queueName);
+    const results = messages.map(
+      (): QueueBatchResult => ({
+        messageId: null,
+        error: 'not sent',
+        retryable: true,
+      })
+    );
+    type Pending = {
+      index: number;
+      key?: string;
+      message: QueueMessage;
+      entry: SendMessageBatchRequestEntry;
+      bytes: number;
+    };
+    const byQueue = new Map<string, Pending[]>();
+    await Promise.all(
+      messages.map(async ({ message: payload, opts }, index) => {
+        const key = opts?.idempotencyKey;
+        let messageId = newMessageId();
+        try {
+          if (key) {
+            const reservation = await idempotency.reserve(key, messageId);
+            if (!reservation.owner) {
+              results[index] = { messageId: reservation.messageId };
+              return;
+            }
+            messageId = reservation.messageId;
+          }
+        } catch (error) {
+          results[index] = {
+            messageId: null,
+            error: describe(error),
+            retryable: true,
+          };
+          return;
+        }
+        const schedule = scheduleOf(opts?.delaySeconds);
+        const message: QueueMessage = {
+          ...prepare(queueName, payload, opts, messageId),
+          ...(schedule.notBefore !== undefined && {
+            notBefore: schedule.notBefore,
+          }),
+        };
+        const body = encodeMessage(message);
+        const url = queueUrlFor(payload);
+        const pending = byQueue.get(url) ?? [];
+        pending.push({
+          index,
+          ...(key !== undefined && { key }),
+          message,
+          entry: {
+            Id: String(index),
+            MessageBody: body,
+            ...(schedule.delaySeconds > 0 && {
+              DelaySeconds: schedule.delaySeconds,
+            }),
+          },
+          bytes: Buffer.byteLength(body),
+        });
+        byQueue.set(url, pending);
+      })
+    );
+
+    const sendChunk = async (url: string, chunk: Pending[]) => {
+      const byId = new Map(chunk.map((each) => [each.entry.Id, each]));
+      try {
+        const output = await sqs.send(
+          new SendMessageBatchCommand({
+            QueueUrl: url,
+            Entries: chunk.map((each) => each.entry),
+          })
+        );
+        for (const ok of output.Successful ?? []) {
+          const each = byId.get(ok.Id);
+          if (!each) continue;
+          results[each.index] = { messageId: each.message.messageId };
+          if (each.key)
+            await idempotency.confirm(each.key, each.message.messageId);
+        }
+        for (const failed of output.Failed ?? []) {
+          const each = byId.get(failed.Id);
+          if (!each) continue;
+          results[each.index] = {
+            messageId: null,
+            error: `${failed.Code ?? 'Error'}: ${failed.Message ?? 'not sent'}`,
+            retryable: failed.SenderFault !== true,
+          };
+          if (each.key)
+            await idempotency.release(each.key, each.message.messageId);
+        }
+      } catch (error) {
+        for (const each of chunk) {
+          results[each.index] = {
+            messageId: null,
+            error: describe(error),
+            retryable: true,
+          };
+          if (each.key)
+            await idempotency.release(each.key, each.message.messageId);
+        }
+      }
+    };
+
+    const sends: Promise<void>[] = [];
+    for (const [url, pending] of byQueue) {
+      let chunk: Pending[] = [];
+      let bytes = 0;
+      for (const each of pending) {
+        if (
+          chunk.length === MAX_BATCH_ENTRIES ||
+          (chunk.length > 0 && bytes + each.bytes > MAX_BATCH_BYTES)
+        ) {
+          sends.push(sendChunk(url, chunk));
+          chunk = [];
+          bytes = 0;
+        }
+        chunk.push(each);
+        bytes += each.bytes;
+      }
+      if (chunk.length > 0) sends.push(sendChunk(url, chunk));
+    }
+    await Promise.all(sends);
+    return results;
+  };
+
+  const startWorker = async (): Promise<boolean> => {
+    if (closed || consumer) return false;
+    if (shared.consumer) return false;
+    consumer = new Consumer({
+      sqs,
+      queueUrls: [workflowQueueUrl, stepQueueUrl],
+      concurrency: options.concurrency,
+      visibilityTimeoutSeconds: options.visibilityTimeoutSeconds,
+      pollWaitSeconds: options.pollWaitSeconds,
+      shutdownGraceMs: options.shutdownGraceMs,
+      runGate: shared.runGate,
+      deliver: (delivery) =>
+        deliver(
+          {
+            handlers: shared.handlers,
+            routes: shared.routes,
+            ...(options.baseUrl !== undefined && { baseUrl: options.baseUrl }),
+            agents,
+          },
+          delivery
+        ),
+      ...options.internal,
+    });
+    shared.consumer = consumer;
+    consumer.start();
+    return true;
+  };
+
+  return {
+    // As world-postgres: the runtime does not check deliveries to the flow
+    // route. IAM decides who can send to the queues, and the route has to be
+    // protected at the network edge (see the README).
+    queueAuthMode: 'skip',
+    getDeploymentId: async () => DEPLOYMENT_ID,
+    queue,
+    queueBatch,
+    createQueueHandler,
+    registerHandler(prefix, handler) {
+      shared.handlers.set(QueuePrefix.parse(prefix), handler);
+    },
+    registerRoute(prefix, path) {
+      shared.routes.set(QueuePrefix.parse(prefix), parseQueueRoute(path));
+    },
+    startWorker,
+    async start() {
+      await startWorker();
+    },
+    close() {
+      closed = true;
+      closing ??= (async () => {
+        if (consumer) {
+          await consumer.close();
+          if (shared.consumer === consumer) delete shared.consumer;
+        }
+        destroyNodeHttpAgents(agents);
+      })();
+      return closing;
+    },
+  };
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error
+    ? `${error.name}: ${error.message}`
+    : String(error);
+}
