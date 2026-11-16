@@ -175,6 +175,57 @@ describe('writes', () => {
     expect(transactions()).toHaveLength(5);
   });
 
+  it('retries only a cancellation that lost a race', async () => {
+    serveTail(() => 0);
+    ddb.on(GetCommand).resolves({});
+    ddb
+      .on(TransactWriteCommand)
+      .rejectsOnce(cancelled(['None', 'TransactionConflict', 'None']))
+      .resolves({});
+    await streamer.streams.write(runId, 'out', 'x');
+    expect(transactions()).toHaveLength(2);
+
+    for (const code of [
+      'ValidationError',
+      'ProvisionedThroughputExceeded',
+      'ItemCollectionSizeLimitExceeded',
+    ]) {
+      ddb.resetHistory();
+      ddb.on(TransactWriteCommand).rejects(cancelled(['None', code, 'None']));
+      await expect(
+        streamer.streams.write(runId, 'other', 'x')
+      ).rejects.toMatchObject({ name: 'TransactionCanceledException' });
+      await expect(
+        streamer.streams.close(runId, 'other')
+      ).rejects.toMatchObject({ name: 'TransactionCanceledException' });
+      // One attempt each, no retries and no 503.
+      expect(transactions()).toHaveLength(2);
+    }
+  });
+
+  it('does not hold a write back behind a same-named stream of another run', async () => {
+    serveTail(() => undefined);
+    const otherRun = 'wrun_01JD000000000000000000000B';
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const written: string[] = [];
+    ddb
+      .on(TransactWriteCommand)
+      .callsFake(async (input: TransactWriteCommandInput) => {
+        const target = String(input.TransactItems?.[1]?.Put?.Item?.runId);
+        if (target === runId) await firstHeld;
+        written.push(target);
+        return {};
+      });
+
+    const first = streamer.streams.write(runId, 'out', 'a');
+    const second = streamer.streams.write(otherRun, 'out', 'b');
+    await vi.waitFor(() => expect(written).toEqual([otherRun]));
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(written).toEqual([otherRun, runId]);
+  });
+
   it('surfaces any other DynamoDB error', async () => {
     serveTail(() => undefined);
     ddb.on(TransactWriteCommand).rejects(new Error('AccessDenied'));
@@ -400,6 +451,29 @@ describe('readers', () => {
     const reader = (await streamer.streams.get(runId, 'out', -2)).getReader();
     expect(Buffer.from((await reader.read()).value ?? []).toString()).toBe('b');
     await reader.cancel();
+  });
+
+  it('refuses a reader whose negative start resolved after the World closed', async () => {
+    let answer!: () => void;
+    ddb.on(GetCommand).callsFake(
+      () =>
+        new Promise((resolve) => {
+          answer = () => resolve({});
+        })
+    );
+    ddb.on(QueryCommand).resolves({ Items: [{ SK: chunkSk(2) }] });
+
+    const opening = streamer.streams.get(runId, 'out', -1);
+    await vi.waitFor(() =>
+      expect(ddb.commandCalls(GetCommand)).toHaveLength(1)
+    );
+    await streamer.close();
+    answer();
+
+    await expect(opening).rejects.toThrow('World has been closed');
+    const queries = ddb.commandCalls(QueryCommand).length;
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS * 3));
+    expect(ddb.commandCalls(QueryCommand)).toHaveLength(queries);
   });
 });
 
