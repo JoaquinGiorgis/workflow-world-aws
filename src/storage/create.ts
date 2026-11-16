@@ -64,6 +64,11 @@ import { attributesOf } from './runs.js';
 import type { TransactItem } from './table.js';
 import { toStorable } from './values.js';
 
+/** Tags the hook id pointer delete of a `hook_disposed`. */
+function disposalTag(hookId: string): string {
+  return `dispose:${hookId}`;
+}
+
 function stepItem(step: Record<string, unknown>): Item {
   return toStorable(step) as Item;
 }
@@ -239,6 +244,17 @@ async function decide(
           'eventData' in data ? data.eventData : undefined
         );
         if (refusal) throw refusal;
+      }
+      // The hook was there when the previous attempt decided, and another
+      // disposal took it first: world-postgres answers that race with a
+      // conflict, not with a missing hook.
+      if (
+        data.eventType === 'hook_disposed' &&
+        attempt.failure?.reasons.has(disposalTag(data.correlationId))
+      ) {
+        throw new EntityConflictError(
+          `Hook "${data.correlationId}" already disposed`
+        );
       }
       throw new HookNotFoundError(data.correlationId);
     }
@@ -494,6 +510,7 @@ async function decide(
       const writes: TaggedItem[] = [
         { item: { Delete: { Key: hookKey(hookRunId, hookId) } } },
         {
+          tag: disposalTag(hookId),
           item: {
             Delete: {
               Key: hookIdKey(hookId),

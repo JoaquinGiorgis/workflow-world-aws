@@ -14,6 +14,7 @@ import {
   runMetaKey,
 } from '../../src/keys.js';
 import {
+  appendsEvent,
   createStorageTestContext,
   type StorageTestContext,
 } from './storage-context.js';
@@ -171,6 +172,47 @@ describe('DynamoDB storage', () => {
       cursor = result.cursor ?? undefined;
     }
     expect(seen).toEqual(wanted);
+  });
+
+  it('answers a disposal that lost to a concurrent one with a conflict, as world-postgres', async () => {
+    const runId = await runningRun();
+    await world.events.create(runId, {
+      eventType: 'hook_created',
+      correlationId: 'hook_race',
+      eventData: { token: 'token_race' },
+    });
+    // The first disposer has read the live hook; the second commits in the
+    // gap before the first one's transaction.
+    context.beforeNextTransaction(
+      (input) =>
+        appendsEvent(input, (event) => event.eventType === 'hook_disposed'),
+      async () => {
+        await context.secondWorld().events.create(runId, {
+          eventType: 'hook_disposed',
+          correlationId: 'hook_race',
+        });
+      }
+    );
+    await expect(
+      world.events.create(runId, {
+        eventType: 'hook_disposed',
+        correlationId: 'hook_race',
+      })
+    ).rejects.toMatchObject({
+      name: 'EntityConflictError',
+      message: 'Hook "hook_race" already disposed',
+    });
+    const log = await world.events.list({ runId });
+    expect(
+      log.data.filter((event) => event.eventType === 'hook_disposed')
+    ).toHaveLength(1);
+    // Disposing a hook that is simply gone is still a missing hook.
+    await expect(
+      world.events.create(runId, {
+        eventType: 'hook_disposed',
+        correlationId: 'hook_race',
+      })
+    ).rejects.toMatchObject({ name: 'HookNotFoundError' });
   });
 
   it('refuses a cursor it did not mint', async () => {
