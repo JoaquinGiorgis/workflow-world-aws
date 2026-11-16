@@ -267,6 +267,96 @@ describe('the worker', () => {
     expect(visibilityChanges()).toHaveLength(beats);
   });
 
+  describe('a heartbeat in flight when the delivery ends', () => {
+    /**
+     * Records when each SQS call of a receipt starts and ends; heartbeats
+     * (`VisibilityTimeout` 45) take 40 ms, so one is usually in flight.
+     */
+    function recordTimeline(): string[] {
+      const timeline: string[] = [];
+      mocks.sqsMock
+        .on(ChangeMessageVisibilityCommand)
+        .callsFake(async (input: { VisibilityTimeout: number }) => {
+          timeline.push(`visibility ${input.VisibilityTimeout} start`);
+          if (input.VisibilityTimeout === 45) {
+            await new Promise((resolve) => setTimeout(resolve, 40));
+          }
+          timeline.push(`visibility ${input.VisibilityTimeout} end`);
+          return {};
+        });
+      mocks.sqsMock.on(DeleteMessageCommand).callsFake(async () => {
+        timeline.push('delete');
+        return {};
+      });
+      return timeline;
+    }
+
+    /** Whether every heartbeat that started before `index` had ended. */
+    function beatsSettledBefore(timeline: string[], index: number): boolean {
+      const before = timeline.slice(0, index);
+      return (
+        before.filter((entry) => entry === 'visibility 45 start').length ===
+        before.filter((entry) => entry === 'visibility 45 end').length
+      );
+    }
+
+    it('settles the beat before deleting an acknowledged message', async () => {
+      const timeline = recordTimeline();
+      const handler = vi.fn(async () => {
+        // End the delivery while a heartbeat is in flight.
+        await vi.waitFor(() =>
+          expect(timeline.at(-1)).toBe('visibility 45 start')
+        );
+      });
+      const { queue, options } = await worker(handler, {
+        visibilityTimeoutSeconds: 45,
+        internal: { log: () => {}, heartbeatIntervalMs: 10 },
+      });
+      serveMessages(mocks, options.workflowQueueUrl, [
+        sqsMessage({ payload: { runId: 'wrun_A' } }),
+      ]);
+      await queue.startWorker();
+
+      await vi.waitFor(() => expect(timeline).toContain('delete'));
+      const deleteAt = timeline.indexOf('delete');
+      expect(beatsSettledBefore(timeline, deleteAt)).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(timeline.slice(deleteAt + 1)).toEqual([]);
+    });
+
+    it('settles the beat before setting the backoff of a failed delivery', async () => {
+      const timeline = recordTimeline();
+      const handler = vi.fn(async () => {
+        await vi.waitFor(() =>
+          expect(timeline.at(-1)).toBe('visibility 45 start')
+        );
+        throw new Error('storage is down');
+      });
+      const { queue, options } = await worker(handler, {
+        visibilityTimeoutSeconds: 45,
+        internal: {
+          log: () => {},
+          heartbeatIntervalMs: 10,
+          retryDelaySeconds: () => 3,
+        },
+      });
+      serveMessages(mocks, options.workflowQueueUrl, [
+        sqsMessage({ payload: { runId: 'wrun_A' } }),
+      ]);
+      await queue.startWorker();
+
+      await vi.waitFor(() => expect(timeline).toContain('visibility 3 end'));
+      const backoffAt = timeline.indexOf('visibility 3 start');
+      expect(beatsSettledBefore(timeline, backoffAt)).toBe(true);
+      // The backoff is the last visibility the message gets.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(timeline.slice(backoffAt)).toEqual([
+        'visibility 3 start',
+        'visibility 3 end',
+      ]);
+    });
+  });
+
   it('polls again after ReceiveMessage fails', async () => {
     const handler = vi.fn(async () => undefined);
     const log = vi.fn();
@@ -534,6 +624,71 @@ describe('close()', () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(visibilityChanges()).toHaveLength(beats);
     expect(deleted()).toEqual([]);
+  });
+
+  it('gives a received message that has not started back at once, after its heartbeat', async () => {
+    const timeline: string[] = [];
+    mocks.sqsMock
+      .on(ChangeMessageVisibilityCommand)
+      .callsFake(
+        async (input: { ReceiptHandle: string; VisibilityTimeout: number }) => {
+          timeline.push(`${input.ReceiptHandle} ${input.VisibilityTimeout}`);
+          if (input.VisibilityTimeout === 45) {
+            await new Promise((resolve) => setTimeout(resolve, 30));
+          }
+          timeline.push(
+            `${input.ReceiptHandle} ${input.VisibilityTimeout} end`
+          );
+          return {};
+        }
+      );
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => (started = resolve));
+    const handler = vi.fn(async () => {
+      started();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    const { queue, options } = await worker(handler, {
+      shutdownGraceMs: 2_000,
+      visibilityTimeoutSeconds: 45,
+      internal: { log: () => {}, heartbeatIntervalMs: 10 },
+    });
+    // Two orchestrator messages of one spec 9 run: the second waits for the
+    // first at the run gate, received but not started.
+    const first = sqsMessage({
+      payload: { runId: 'wrun_A', runSpecVersion: 9 },
+    });
+    const second = sqsMessage({
+      payload: { runId: 'wrun_A', runSpecVersion: 9 },
+    });
+    serveMessages(mocks, options.workflowQueueUrl, [first, second]);
+    await queue.startWorker();
+    await running;
+    await vi.waitFor(() =>
+      expect(timeline).toContain(`${second.ReceiptHandle} 45`)
+    );
+
+    await queue.close();
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(deleted()).toEqual([first.ReceiptHandle]);
+    const mine = timeline.filter((entry) =>
+      entry.startsWith(`${second.ReceiptHandle} `)
+    );
+    // Given back with visibility 0, after every heartbeat of it had ended,
+    // and nothing after that.
+    const givenBack = mine.indexOf(`${second.ReceiptHandle} 0`);
+    expect(givenBack).toBeGreaterThan(0);
+    const before = mine.slice(0, givenBack);
+    expect(before.filter((entry) => entry.endsWith(' 45')).length).toBe(
+      before.filter((entry) => entry.endsWith(' 45 end')).length
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(
+      timeline
+        .filter((entry) => entry.startsWith(`${second.ReceiptHandle} `))
+        .slice(givenBack)
+    ).toEqual([`${second.ReceiptHandle} 0`, `${second.ReceiptHandle} 0 end`]);
   });
 
   it('is idempotent and leaves a closed queue stopped', async () => {
