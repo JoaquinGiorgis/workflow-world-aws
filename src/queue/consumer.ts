@@ -25,13 +25,13 @@
  *   it to the dead-letter queue.
  *
  * A spec 9 run's orchestrator deliveries wait for each other in this
- * process (`RunGate`), as in world-local. Across processes nothing
- * serializes them, which is why the World does not declare `maxConcurrency`;
- * the in-band fence keeps an overlap safe.
+ * process (`RunGate`), as in world-local, and hold no slot while they wait.
+ * Across processes nothing serializes them, which is why the World does not
+ * declare `maxConcurrency`; the in-band fence keeps an overlap safe.
  *
  * `close()` stops receiving, then waits up to `shutdownGraceMs` for the
- * running deliveries. A message whose delivery has not started yet is made
- * visible again at once. One still running at the deadline is abandoned:
+ * running deliveries. A message whose delivery has not started yet (one
+ * waiting for its run included) is made visible again at once. One still running at the deadline is abandoned:
  * its heartbeat stops, nothing is acknowledged, and SQS delivers it again
  * once its visibility timeout runs out.
  */
@@ -160,18 +160,45 @@ export interface ConsumerOptions {
 /** A counting semaphore whose waiters can be woken to give up. */
 class Slots {
   private waiters: (() => void)[] = [];
+  /** Deliveries waiting to take back the slot they gave up. */
+  private returning = 0;
 
   constructor(private available: number) {}
 
-  /** Takes between 1 and `max` slots, or 0 once `stopped()` is true. */
+  /**
+   * Takes between 1 and `max` slots for new receives, or 0 once `stopped()`
+   * is true. Deliveries taking their slot back go first.
+   */
   async take(max: number, stopped: () => boolean): Promise<number> {
-    while (this.available === 0 && !stopped()) {
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    while ((this.available === 0 || this.returning > 0) && !stopped()) {
+      await this.wait();
     }
     if (stopped()) return 0;
     const taken = Math.min(max, this.available);
     this.available -= taken;
     return taken;
+  }
+
+  /**
+   * Takes one slot back for a received message that gave its own up while
+   * it waited, ahead of new receives. False once `stopped()` is true.
+   */
+  async takeBack(stopped: () => boolean): Promise<boolean> {
+    this.returning++;
+    try {
+      while (this.available === 0 && !stopped()) await this.wait();
+    } finally {
+      this.returning--;
+    }
+    // Receives held back for this one may go on.
+    this.wakeAll();
+    if (stopped()) return false;
+    this.available--;
+    return true;
+  }
+
+  private wait(): Promise<void> {
+    return new Promise<void>((resolve) => this.waiters.push(resolve));
   }
 
   give(count: number): void {
@@ -185,6 +212,14 @@ class Slots {
     this.waiters = [];
     for (const wake of waiters) wake();
   }
+}
+
+/** The slot a received message holds while it is handled. */
+interface Slot {
+  /** Gives it up (once); handling ends with this too. */
+  give(): void;
+  /** Takes it back after `give()`; false when the worker is closing. */
+  takeBack(): Promise<boolean>;
 }
 
 export class Consumer {
@@ -293,7 +328,19 @@ export class Consumer {
         await sleep(EMPTY_POLL_PAUSE_MS, this.abort.signal);
       }
       for (const message of messages) {
-        const task = this.handle(queueUrl, message)
+        let held = true;
+        const slot: Slot = {
+          give: () => {
+            if (!held) return;
+            held = false;
+            slots.give(1);
+          },
+          takeBack: async () => {
+            held = await slots.takeBack(() => this.stopping);
+            return held;
+          },
+        };
+        const task = this.handle(queueUrl, message, slot)
           .catch((error: unknown) => {
             this.log('A queue message could not be handled', {
               queueUrl,
@@ -302,14 +349,18 @@ export class Consumer {
           })
           .finally(() => {
             this.running.delete(task);
-            slots.give(1);
+            slot.give();
           });
         this.running.add(task);
       }
     }
   }
 
-  private async handle(queueUrl: string, received: Message): Promise<void> {
+  private async handle(
+    queueUrl: string,
+    received: Message,
+    slot: Slot
+  ): Promise<void> {
     const receiveCount = Math.max(
       1,
       Number(received.Attributes?.ApproximateReceiveCount ?? 1) || 1
@@ -360,15 +411,23 @@ export class Consumer {
     // landing after it would reset the visibility it set.
     const stopHeartbeat = this.heartbeat(queueUrl, receipt);
     const gateKey = runGateKey(message);
+    let release: (() => void) | undefined;
     if (gateKey && this.options.runGate.isHeld(gateKey)) {
+      // Another delivery of the run runs here. Waiting for it holds no
+      // slot, so other runs keep their share (world-local takes its run
+      // gate before its worker slot too); the slot is taken back, ahead of
+      // new receives, when its turn comes. close() ends the wait at once.
       debugLog('queue delivery waits for its run', traceOf(message));
+      slot.give();
+      release = await this.options.runGate.acquire(gateKey, this.abort.signal);
+      if (release) await slot.takeBack();
+    } else if (gateKey) {
+      release = await this.options.runGate.acquire(gateKey);
     }
-    const release = gateKey
-      ? await this.options.runGate.acquire(gateKey)
-      : undefined;
     try {
       if (this.stopping) {
-        // Received but not started: give it back at once.
+        // Received but not started (or still waiting for its run): give it
+        // back at once.
         await stopHeartbeat();
         await this.changeVisibility(queueUrl, receipt, 0);
         return;

@@ -63,7 +63,15 @@ export function nextUlid(): string {
 export class RunGate {
   private readonly tails = new Map<string, Promise<void>>();
 
-  async acquire(key: string): Promise<() => void> {
+  /**
+   * Waits for `key`'s turn and returns its release. With `signal`, a wait
+   * that is aborted gives its turn up and answers `undefined`; the ones
+   * behind it keep their order.
+   */
+  async acquire(
+    key: string,
+    signal?: AbortSignal
+  ): Promise<(() => void) | undefined> {
     const previous = this.tails.get(key) ?? Promise.resolve();
     let release!: () => void;
     const mine = new Promise<void>((resolve) => {
@@ -71,7 +79,13 @@ export class RunGate {
     });
     const tail = previous.then(() => mine);
     this.tails.set(key, tail);
-    await previous;
+    if (!(await turnCame(previous, signal))) {
+      release();
+      void tail.then(() => {
+        if (this.tails.get(key) === tail) this.tails.delete(key);
+      });
+      return undefined;
+    }
     let released = false;
     return () => {
       if (released) return;
@@ -90,4 +104,21 @@ export class RunGate {
   get size(): number {
     return this.tails.size;
   }
+}
+
+/** Whether `previous` settled before `signal` aborted. */
+function turnCame(
+  previous: Promise<void>,
+  signal: AbortSignal | undefined
+): Promise<boolean> {
+  if (!signal) return previous.then(() => true);
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const onAbort = () => resolve(false);
+    signal.addEventListener('abort', onAbort, { once: true });
+    void previous.then(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(true);
+    });
+  });
 }
