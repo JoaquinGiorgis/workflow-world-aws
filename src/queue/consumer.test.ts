@@ -268,17 +268,29 @@ describe('the worker', () => {
   });
 
   describe('a heartbeat in flight when the delivery ends', () => {
+    /** Resolves when the next heartbeat starts. */
+    let beatStarted: () => Promise<void>;
+
     /**
      * Records when each SQS call of a receipt starts and ends; heartbeats
-     * (`VisibilityTimeout` 45) take 40 ms, so one is usually in flight.
+     * (`VisibilityTimeout` 45) take 40 ms, and `beatStarted()` resolves
+     * while one is in flight.
      */
     function recordTimeline(): string[] {
       const timeline: string[] = [];
+      let onBeat: (() => void)[] = [];
+      beatStarted = () =>
+        new Promise<void>((resolve) => {
+          onBeat.push(resolve);
+        });
       mocks.sqsMock
         .on(ChangeMessageVisibilityCommand)
         .callsFake(async (input: { VisibilityTimeout: number }) => {
           timeline.push(`visibility ${input.VisibilityTimeout} start`);
           if (input.VisibilityTimeout === 45) {
+            const waiting = onBeat;
+            onBeat = [];
+            for (const resolve of waiting) resolve();
             await new Promise((resolve) => setTimeout(resolve, 40));
           }
           timeline.push(`visibility ${input.VisibilityTimeout} end`);
@@ -304,9 +316,7 @@ describe('the worker', () => {
       const timeline = recordTimeline();
       const handler = vi.fn(async () => {
         // End the delivery while a heartbeat is in flight.
-        await vi.waitFor(() =>
-          expect(timeline.at(-1)).toBe('visibility 45 start')
-        );
+        await beatStarted();
       });
       const { queue, options } = await worker(handler, {
         visibilityTimeoutSeconds: 45,
@@ -327,9 +337,7 @@ describe('the worker', () => {
     it('settles the beat before setting the backoff of a failed delivery', async () => {
       const timeline = recordTimeline();
       const handler = vi.fn(async () => {
-        await vi.waitFor(() =>
-          expect(timeline.at(-1)).toBe('visibility 45 start')
-        );
+        await beatStarted();
         throw new Error('storage is down');
       });
       const { queue, options } = await worker(handler, {
